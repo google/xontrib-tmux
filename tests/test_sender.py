@@ -190,5 +190,71 @@ def test_macro_compound_block_with_else_and_following_stmt(
         "else:",
         "    a = 3",
         PASTE_END,
+        f"{PASTE_START}{PASTE_END}",
         f"{PASTE_START}echo done{PASTE_END}",
     ]
+
+
+def test_macro_multiline_string_with_col0_lines(
+    gated_wait: Any,
+) -> None:
+    from xontrib_tmux.block import PASTE_END, PASTE_START, TmuxMacro  # type: ignore
+
+    gate, _ = gated_wait
+    pane = FakePane("%macro-col0-str")
+
+    macro = TmuxMacro(pane)
+    macro.macro_block = (
+        'msg = """first line\n'
+        "\n"
+        'second line at col 0"""\n'
+        "echo @(msg)\n"
+    )
+    with macro:
+        pass
+    gate.set()
+    macro.future.result(timeout=5.0)
+    assert pane.sent == [
+        f'{PASTE_START}msg = """first line',
+        "",
+        'second line at col 0"""',
+        PASTE_END,
+        f"{PASTE_START}echo @(msg){PASTE_END}",
+    ]
+
+
+def test_deliver_waits_for_raw_tty_between_commands(
+    gated_wait: Any, monkeypatch: Any
+) -> None:
+    from xontrib_tmux import sender  # type: ignore
+    from xontrib_tmux.block import PASTE_END, PASTE_START  # type: ignore
+
+    gate, _ = gated_wait
+    gate.set()
+
+    pane = FakePane("%deliver-between")
+    pane.pane_tty = "/dev/pts/fake"
+
+    # Simulate tty going cooked after line 1 is sent, then returning to raw.
+    states = iter([False, False, True])
+    polled: List[str] = []
+
+    def fake_tty_is_raw(tty: str) -> bool:
+        polled.append(tty)
+        return next(states, True)
+
+    monkeypatch.setattr(sender, "tty_is_raw", fake_tty_is_raw)
+
+    sender.deliver(
+        pane,
+        [
+            f"{PASTE_START}cmd1{PASTE_END}",
+            f"{PASTE_START}cmd2{PASTE_END}",
+        ],
+    ).result(timeout=5.0)
+
+    assert pane.sent == [
+        f"{PASTE_START}cmd1{PASTE_END}",
+        f"{PASTE_START}cmd2{PASTE_END}",
+    ]
+    assert len(polled) >= 2

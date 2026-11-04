@@ -27,15 +27,97 @@ hook installed via ``xontrib_tmux.pth`` so ``xonsh.parser_table`` is patched
 as soon as it is imported.
 """
 
+import builtins
 from importlib.abc import Loader, MetaPathFinder
 from importlib.machinery import ModuleSpec
+import io
+import os
 import sys
+import tokenize
 from types import ModuleType
 from typing import Any, Optional, Sequence
 
 
 _FSTRING_TOKENS = ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END")
 _NODEDENT_LHS = ("nodedent", "any_dedent_tok", "any_dedent_toks")
+
+
+def _is_autoload_disabled() -> bool:
+    """Returns True if xontrib autoloading is disabled for ``tmux``."""
+    xsh = getattr(builtins, "__xonsh__", None)
+    env = getattr(xsh, "env", None)
+    if env is not None and "XONTRIBS_AUTOLOAD_DISABLED" in env:
+        disabled = env.get("XONTRIBS_AUTOLOAD_DISABLED")
+        if disabled is True:
+            return True
+        if isinstance(disabled, (list, tuple, set, frozenset)) and "tmux" in disabled:
+            return True
+    raw = os.environ.get("XONTRIBS_AUTOLOAD_DISABLED", "")
+    if raw.lower() in ("1", "true", "yes"):
+        return True
+    if "tmux" in [item.strip() for item in raw.split(",")]:
+        return True
+    return False
+
+
+def _find_unterminated_fstring(src: str) -> Optional[str]:
+    """Returns an error message if ``src`` contains an unterminated f-string."""
+    try:
+        for _ in tokenize.generate_tokens(io.StringIO(src).readline):
+            pass
+    except tokenize.TokenError as exc:
+        msg = exc.args[0] if exc.args else ""
+        if "f-string" in msg:
+            return msg
+    except IndentationError:
+        pass
+    return None
+
+
+def _patch_base_parser() -> None:
+    """Patches ``xonsh.parsers.base.BaseParser`` for regenerated tables and f-string checks."""
+    base_mod = sys.modules.get("xonsh.parsers.base")
+    if base_mod is None:
+        try:
+            import xonsh.parsers.base as base_mod  # type: ignore
+        except ImportError:
+            return
+    base_parser = getattr(base_mod, "BaseParser", None)
+    if base_parser is None or getattr(base_parser, "_xontrib_tmux_patched", False):
+        return
+
+    def _attach_nodedent_base_rules(self: Any) -> None:
+        toks = set(self.tokens)
+        toks.discard("DEDENT")
+        toks.discard("INDENT")
+        toks.discard("ENDMARKER")
+        ts = "\n       | ".join(sorted(toks))
+        self.p_nodedent_base.__func__.__doc__ = "nodedent : " + ts + "\n"
+
+    orig_rawsuite = base_parser.p_rawsuite_indent
+
+    def p_rawsuite_indent(self: Any, p: Any) -> None:
+        orig_rawsuite(self, p)
+        block_val = getattr(p[0], "value", None)
+        if isinstance(block_val, str):
+            err = _find_unterminated_fstring(block_val)
+            if err is not None:
+                self._set_error(err, None)
+                raise SyntaxError(err)
+
+    p_rawsuite_indent.__doc__ = orig_rawsuite.__doc__
+    base_parser._attach_nodedent_base_rules = _attach_nodedent_base_rules
+    base_parser.p_rawsuite_indent = p_rawsuite_indent
+    base_parser._xontrib_tmux_patched = True
+
+    xsh = getattr(builtins, "__xonsh__", None)
+    parser_obj = getattr(getattr(xsh, "execer", None), "parser", None)
+    lr_parser = getattr(parser_obj, "parser", None)
+    for prod in getattr(lr_parser, "productions", None) or ():
+        if getattr(prod, "name", None) == "rawsuite" and getattr(
+            getattr(prod, "func", None), "__name__", None
+        ) == "p_rawsuite_indent":
+            prod.func = p_rawsuite_indent.__get__(parser_obj, type(parser_obj))
 
 
 def patch_parser_table(parser_table: Any) -> None:
@@ -84,8 +166,19 @@ def patch_parser_table(parser_table: Any) -> None:
     parser_table._xontrib_tmux_fstring_patched = True
 
 
+def _remove_hook() -> None:
+    """Removes any installed ``_ParserTableImportHook`` from ``sys.meta_path``."""
+    global _hook_instance
+    if _hook_instance is not None:
+        try:
+            sys.meta_path.remove(_hook_instance)
+        except ValueError:
+            pass
+        _hook_instance = None
+
+
 def patch_xonsh_parser() -> None:
-    """Patches ``xonsh.parser_table`` if loaded or imports and patches it."""
+    """Patches ``xonsh.parser_table`` and ``BaseParser``."""
     pt = sys.modules.get("xonsh.parser_table")
     if pt is None:
         try:
@@ -93,10 +186,12 @@ def patch_xonsh_parser() -> None:
         except ImportError:
             return
     patch_parser_table(pt)
+    _patch_base_parser()
+    _remove_hook()
 
 
 class _ParserTableImportHook(MetaPathFinder, Loader):
-    """Patches ``xonsh.parser_table`` immediately when it is imported."""
+    """Patches ``xonsh.parser_table`` once when it is imported, then removes itself."""
 
     _in_progress = False
 
@@ -127,8 +222,15 @@ class _ParserTableImportHook(MetaPathFinder, Loader):
                             return create(s) if create is not None else None
 
                         def exec_module(self, module: ModuleType) -> None:
+                            spec.loader = orig_loader
                             orig_loader.exec_module(module)
-                            patch_parser_table(module)
+                            _remove_hook()
+                            if not _is_autoload_disabled():
+                                patch_parser_table(module)
+                                _patch_base_parser()
+
+                        def __getattr__(self, name: str) -> Any:
+                            return getattr(orig_loader, name)
 
                     spec.loader = _WrappedLoader()
                     return spec
@@ -137,15 +239,19 @@ class _ParserTableImportHook(MetaPathFinder, Loader):
             self._in_progress = False
 
 
-_hook_installed = False
+_hook_instance: Optional[_ParserTableImportHook] = None
 
 
 def install_parser_patch_hook() -> None:
-    """Installs the ``sys.meta_path`` hook and patches ``xonsh.parser_table`` if already loaded."""
-    global _hook_installed
+    """Installs the ``sys.meta_path`` hook or patches ``xonsh.parser_table`` if already loaded."""
+    global _hook_instance
+    if _is_autoload_disabled():
+        return
     pt = sys.modules.get("xonsh.parser_table")
     if pt is not None:
         patch_parser_table(pt)
-    if not _hook_installed:
-        sys.meta_path.insert(0, _ParserTableImportHook())
-        _hook_installed = True
+        _patch_base_parser()
+        return
+    if _hook_instance is None:
+        _hook_instance = _ParserTableImportHook()
+        sys.meta_path.insert(0, _hook_instance)

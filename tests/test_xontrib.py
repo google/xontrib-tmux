@@ -273,13 +273,32 @@ def test_fstrings_parse_inside_with_bang_blocks(load_xontrib: Any) -> None:
     tree = execer.parse(code, ctx={})
     assert tree is not None
 
+    with pytest.raises(SyntaxError):
+        execer.parse("with! p.send():\n    x = f'unterminated\n", ctx={})
+
+
+def test_parser_patch_hook_removes_itself_and_preserves_loader(
+    load_xontrib: Any,
+) -> None:
+    import inspect
+    import sys
+    import xonsh.parser_table as pt  # type: ignore
+    from xontrib_tmux.parser_patch import _ParserTableImportHook  # type: ignore
+
+    load_xontrib("tmux")
+    assert not any(isinstance(f, _ParserTableImportHook) for f in sys.meta_path)
+    assert pt.__spec__ is not None
+    assert pt.__spec__.loader is not None
+    assert hasattr(pt.__spec__.loader, "get_source")
+    assert inspect.getsourcefile(pt) is not None
+
 
 def test_captured_rc_src_suppresses_shell_history(
-    load_xontrib: Any, monkeypatch: Any
+    load_xontrib: Any, monkeypatch: Any, tmp_path: Any
 ) -> None:
     import dill  # type: ignore
     from xonsh.history.dummy import DummyHistory  # type: ignore
-    from xontrib_tmux.block import TmuxMacro  # type: ignore
+    from xontrib_tmux.block import TmuxMacro, is_pending_capture_cmd  # type: ignore
 
     load_xontrib("tmux")
 
@@ -301,30 +320,116 @@ def test_captured_rc_src_suppresses_shell_history(
 
     ptk_hist = FakePtkHistory()
     mock_xsh = MagicMock()
+    mock_xsh.env = {"LAST_RETURN_CODE": 42}
     mock_xsh.history = hist
     mock_xsh.shell.shell.history = ptk_hist
     monkeypatch.setattr(builtins, "__xonsh__", mock_xsh, raising=False)
 
-    macro = TmuxMacro(MagicMock(), captured={"issue": dill.dumps("42")})
-    rc_bytes = macro.rc_src()
-    assert rc_bytes is not None
+    post_fired: List[Any] = []
+    mock_events = MagicMock()
+    mock_events.on_postcommand.fire = lambda **kw: post_fired.append(kw)
+    monkeypatch.setattr(builtins, "events", mock_events, raising=False)
 
-    # Simulate prompt_toolkit adding the source line before BaseShell.default
-    # runs the script and calls hist.append in its finally block.
-    cmd_str = "source /tmp/captured_abc123.xsh"
+    rc_file = tmp_path / "captured_abc123.xsh"
+    macro = TmuxMacro(MagicMock(), captured={"issue": dill.dumps("42")})
+    rc_bytes = macro.rc_src(rc_path=str(rc_file))
+    assert rc_bytes is not None
+    rc_file.write_bytes(rc_bytes)
+
+    cmd_str = f"source {rc_file}"
+    assert is_pending_capture_cmd(cmd_str)
+
+    # 1. Plugin delivery execution: suppressed from history and postcommand,
+    # preserves LAST_RETURN_CODE, and keeps the file on disk marked delivered.
     ptk_hist.append_string("echo before")
     ptk_hist.append_string(cmd_str)
 
     ns: dict[str, Any] = {}
-    exec(rc_bytes.decode("utf-8"), ns)
+    exec(rc_file.read_text(encoding="utf-8"), ns)
     assert ns["issue"] == "42"
+    assert rc_file.exists()
+    assert not is_pending_capture_cmd(cmd_str)
 
+    mock_xsh.env["LAST_RETURN_CODE"] = 0
     hist.append({"inp": cmd_str + "\n", "rtn": 0})
-    # A subsequent user-typed command (even matching captured_*.xsh) must
-    # still be recorded in both histories.
-    user_source = "source /tmp/captured_user_typed.xsh"
-    ptk_hist.append_string(user_source)
-    hist.append({"inp": user_source + "\n", "rtn": 0})
+    mock_events.on_postcommand.fire(cmd=cmd_str)
 
-    assert hist.inps == [user_source]
-    assert ptk_hist._loaded_strings == [user_source, "echo before"]
+    assert mock_xsh.env["LAST_RETURN_CODE"] == 42
+    assert post_fired == []
+    assert hist.inps == []
+    assert ptk_hist._loaded_strings == ["echo before"]
+
+    # 2. If the user manually re-runs the same file later, it IS recorded.
+    ptk_hist.append_string(cmd_str)
+    exec(rc_file.read_text(encoding="utf-8"), {})
+    hist.append({"inp": cmd_str + "\n", "rtn": 0})
+    mock_events.on_postcommand.fire(cmd=cmd_str)
+
+    assert hist.inps == [cmd_str]
+    assert ptk_hist._loaded_strings == [cmd_str, "echo before"]
+    assert len(post_fired) == 1
+
+
+def test_autoload_disabled_skips_import_hook(monkeypatch: Any) -> None:
+    import sys
+    from xontrib_tmux import parser_patch  # type: ignore
+
+    parser_patch._remove_hook()
+    monkeypatch.setenv("XONTRIBS_AUTOLOAD_DISABLED", "tmux")
+    monkeypatch.delitem(sys.modules, "xonsh.parser_table", raising=False)
+
+    parser_patch.install_parser_patch_hook()
+    assert not any(
+        isinstance(f, parser_patch._ParserTableImportHook)
+        for f in sys.meta_path
+    )
+
+
+def test_precommand_skips_pending_capture_and_unload_disconnects(
+    monkeypatch: Any, tmp_path: Any
+) -> None:
+    import dill  # type: ignore
+    import xontrib_tmux  # type: ignore
+    from xontrib_tmux.block import TmuxMacro  # type: ignore
+
+    fake_window = MagicMock()
+    monkeypatch.setattr(xontrib_tmux, "curtmuxw", lambda: fake_window)
+
+    pre_handlers: set = set()
+    post_handlers: set = set()
+
+    class FakeEvent(set):
+        def __call__(self, fn: Any) -> Any:
+            self.add(fn)
+            return fn
+
+    mock_events = MagicMock()
+    mock_events.on_precommand = FakeEvent()
+    mock_events.on_postcommand = FakeEvent()
+    monkeypatch.setattr(builtins, "events", mock_events, raising=False)
+
+    mock_xsh = MagicMock()
+    mock_xsh.ctx = {}
+    xontrib_tmux._load_xontrib_(mock_xsh)
+    assert len(mock_events.on_precommand) == 1
+    assert len(mock_events.on_postcommand) == 1
+
+    rc_file = tmp_path / "captured_win.xsh"
+    macro = TmuxMacro(MagicMock(), captured={"x": dill.dumps(1)})
+    rc_bytes = macro.rc_src(rc_path=str(rc_file))
+    assert rc_bytes is not None
+    rc_file.write_bytes(rc_bytes)
+
+    fake_window.rename_window.reset_mock()
+    for handler in list(mock_events.on_precommand):
+        handler(cmd=f"source {rc_file}")
+    # Pending plugin capture script must not rename window to "source"
+    fake_window.rename_window.assert_not_called()
+
+    for handler in list(mock_events.on_precommand):
+        handler(cmd="vim file.txt")
+    fake_window.rename_window.assert_called_once_with("vim")
+
+    xontrib_tmux._unload_xontrib_(mock_xsh)
+    assert len(mock_events.on_precommand) == 0
+    assert len(mock_events.on_postcommand) == 0

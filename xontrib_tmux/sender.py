@@ -21,19 +21,23 @@ one pane stay ordered while different panes proceed in parallel, and the
 caller gets a :class:`~concurrent.futures.Future` it may ignore or wait on.
 """
 
+from concurrent.futures import Future
 import queue
 import sys
 import threading
+import time
 import traceback
-from concurrent.futures import Future
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import libtmux  # type: ignore
 
-from .ready import wait_until_ready
+from .ready import tty_is_raw, wait_until_ready
 
 
 _Task = Tuple["Future[Any]", Callable[[], Any]]
+
+_PASTE_START = "\x1b[200~"
+_PASTE_END = "\x1b[201~"
 
 _lock = threading.Lock()
 _queues: Dict[Any, "queue.Queue[_Task]"] = {}
@@ -47,6 +51,27 @@ _ready: set = set()
 def _pane_key(pane: libtmux.Pane) -> Any:
     """Returns a stable dict key for ``pane``."""
     return getattr(pane, "pane_id", None) or id(pane)
+
+
+def _wait_between_commands(
+    pane: libtmux.Pane,
+    cook_window: float = 0.05,
+    ready_timeout: float = 5.0,
+) -> None:
+    """Waits for the previous command to finish and the prompt to re-enter raw mode."""
+    tty = getattr(pane, "pane_tty", None)
+    if not tty or tty == "/dev/null":
+        return
+    deadline = time.monotonic() + cook_window
+    while time.monotonic() < deadline:
+        if not tty_is_raw(tty):
+            break
+        time.sleep(0.002)
+    deadline = time.monotonic() + ready_timeout
+    while time.monotonic() < deadline:
+        if tty_is_raw(tty):
+            return
+        time.sleep(0.005)
 
 
 def _pump(work: "queue.Queue[_Task]") -> None:
@@ -116,7 +141,14 @@ def deliver(
         if key not in _ready:
             if wait_until_ready(pane, timeout=timeout):
                 _ready.add(key)
-        for line in lines:
+        in_paste = False
+        for i, line in enumerate(lines):
+            if i > 0 and not in_paste:
+                _wait_between_commands(pane)
             pane.send_keys(line, literal=True, enter=True)
+            if _PASTE_START in line and _PASTE_END not in line:
+                in_paste = True
+            elif _PASTE_END in line:
+                in_paste = False
 
     return submit(pane, _run)

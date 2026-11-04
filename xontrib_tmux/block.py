@@ -14,11 +14,13 @@
 
 """Provides macro block execution and variable capturing for tmux."""
 
+from concurrent.futures import Future
 import inspect
+import io
 import re
 import tempfile
+import tokenize
 import types
-from concurrent.futures import Future
 from typing import Any, Dict, List, Optional
 
 import dill
@@ -30,35 +32,102 @@ from .sender import deliver
 PASTE_START = "\x1b[200~"
 PASTE_END = "\x1b[201~"
 
+_CAPTURE_PENDING_HEADER = "# xontrib-tmux-captured: pending\n"
+_CAPTURE_DELIVERED_HEADER = "# xontrib-tmux-captured: delivered\n"
+
 _CONTINUATION_RE = re.compile(
     r"^(?:elif\b|else\s*:|except\b|finally\s*:|case\b|[)\]}])"
 )
 
-_HISTORY_SUPPRESS_PREAMBLE = """\
-def _xontrib_tmux_suppress_history():
-    import builtins
-    xsh = getattr(builtins, "__xonsh__", None)
-    if xsh is None:
-        return
-    hist = getattr(xsh, "history", None)
-    if hist is not None:
-        orig_append = hist.append
-        def _append_once(cmd, _orig=orig_append):
-            hist.append = _orig
-        hist.append = _append_once
-    ptk_hist = getattr(
-        getattr(getattr(xsh, "shell", None), "shell", None), "history", None
+
+def _build_history_suppress_preamble(rc_path: Optional[str] = None) -> str:
+    """Builds the one-shot history/event suppression preamble for ``rc_src``."""
+    return (
+        f"{_CAPTURE_PENDING_HEADER}"
+        "def _xontrib_tmux_suppress_history():\n"
+        "    import builtins\n"
+        f"    rc_path = {rc_path!r}\n"
+        "    if rc_path is not None:\n"
+        "        try:\n"
+        "            with open(rc_path, 'r', encoding='utf-8') as f:\n"
+        "                content = f.read()\n"
+        f"            if not content.startswith({_CAPTURE_PENDING_HEADER!r}):\n"
+        "                return\n"
+        "            with open(rc_path, 'w', encoding='utf-8') as f:\n"
+        f"                f.write({_CAPTURE_DELIVERED_HEADER!r} + content[{len(_CAPTURE_PENDING_HEADER)}:])\n"
+        "        except OSError:\n"
+        "            return\n"
+        "    xsh = getattr(builtins, '__xonsh__', None)\n"
+        "    if xsh is None:\n"
+        "        return\n"
+        "    env = getattr(xsh, 'env', None)\n"
+        "    had_rtn = env is not None and 'LAST_RETURN_CODE' in env\n"
+        "    prev_rtn = env.get('LAST_RETURN_CODE') if had_rtn else None\n"
+        "    hist = getattr(xsh, 'history', None)\n"
+        "    if hist is not None:\n"
+        "        orig_append = hist.append\n"
+        "        def _append_once(cmd, _orig=orig_append):\n"
+        "            hist.append = _orig\n"
+        "            if env is not None:\n"
+        "                if had_rtn:\n"
+        "                    env['LAST_RETURN_CODE'] = prev_rtn\n"
+        "                else:\n"
+        "                    env.pop('LAST_RETURN_CODE', None)\n"
+        "        hist.append = _append_once\n"
+        "    events = getattr(builtins, 'events', None)\n"
+        "    on_post = getattr(events, 'on_postcommand', None)\n"
+        "    if on_post is not None and hasattr(on_post, 'fire'):\n"
+        "        orig_fire = on_post.fire\n"
+        "        def _fire_once(**kwargs):\n"
+        "            on_post.fire = orig_fire\n"
+        "        on_post.fire = _fire_once\n"
+        "    ptk_hist = getattr(\n"
+        "        getattr(getattr(xsh, 'shell', None), 'shell', None), 'history', None\n"
+        "    )\n"
+        "    loaded = getattr(ptk_hist, '_loaded_strings', None)\n"
+        "    if loaded and loaded[0].lstrip().startswith('source '):\n"
+        "        del loaded[0]\n"
+        "_xontrib_tmux_suppress_history()\n"
+        "del _xontrib_tmux_suppress_history\n"
     )
-    loaded = getattr(ptk_hist, "_loaded_strings", None)
-    if loaded and loaded[0].lstrip().startswith("source "):
-        del loaded[0]
-_xontrib_tmux_suppress_history()
-del _xontrib_tmux_suppress_history
-"""
+
+
+def is_pending_capture_cmd(cmd: str) -> bool:
+    """Returns True if ``cmd`` sources a pending plugin-generated capture file."""
+    parts = cmd.strip().split(maxsplit=1)
+    if len(parts) != 2 or parts[0] != "source":
+        return False
+    path = parts[1].strip()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.readline() == _CAPTURE_PENDING_HEADER
+    except OSError:
+        return False
+
+
+def _has_unclosed_construct(current: List[str]) -> bool:
+    """Returns True if ``current`` ends inside an unclosed string, delimiter, or backslash."""
+    if not current:
+        return False
+    if current[-1].rstrip().endswith("\\"):
+        return True
+    src = "\n".join(current)
+    try:
+        for _ in tokenize.generate_tokens(io.StringIO(src).readline):
+            pass
+    except tokenize.TokenError as exc:
+        msg = exc.args[0] if exc.args else ""
+        if "EOF in multi-line" in msg:
+            return True
+    except IndentationError:
+        pass
+    return False
 
 
 def _continues_block(current: List[str], next_line: str) -> bool:
     """Returns True if ``next_line`` (non-blank) continues ``current``."""
+    if _has_unclosed_construct(current):
+        return True
     if next_line[0] in (" ", "\t"):
         return True
     if _CONTINUATION_RE.match(next_line.lstrip()):
@@ -83,8 +152,12 @@ def _group_statements(raw_lines: List[str]) -> List[List[str]]:
 
     for line in raw_lines:
         if not line.strip():
-            if current:
+            if current and _has_unclosed_construct(current):
+                current.append(line)
+            elif current:
                 pending_blanks.append("")
+            else:
+                groups.append([""])
             continue
 
         if current and _continues_block(current, line):
@@ -94,11 +167,15 @@ def _group_statements(raw_lines: List[str]) -> List[List[str]]:
         else:
             if current:
                 groups.append(current)
+            for _ in pending_blanks:
+                groups.append([""])
             pending_blanks.clear()
             current = [line]
 
     if current:
         groups.append(current)
+    for _ in pending_blanks:
+        groups.append([""])
 
     return groups
 
@@ -123,12 +200,12 @@ class TmuxMacro:
         # done in the background so the calling shell never blocks.
         self.future: Optional["Future[Any]"] = None
 
-    def rc_src(self) -> Optional[bytes]:
+    def rc_src(self, rc_path: Optional[str] = None) -> Optional[bytes]:
         """Generates script bytes to unpickle captured variables in tmux."""
         if self.captured is None:
             return None
 
-        src = _HISTORY_SUPPRESS_PREAMBLE + "import dill\n"
+        src = _build_history_suppress_preamble(rc_path) + "import dill\n"
         for var, pickled_val in self.captured.items():
             src += f"{var} = dill.loads({pickled_val})\n"
         src += "del dill\n"
@@ -138,11 +215,12 @@ class TmuxMacro:
         """Builds the lines to type into the pane, in order."""
         lines = []
         # Pickle the captured dict and unpickle it on the other side
-        rc_src = self.rc_src()
-        if rc_src is not None:
+        if self.captured is not None:
             with tempfile.NamedTemporaryFile(
                 delete=False, prefix='captured_', suffix='.xsh'
             ) as rc_file:
+                rc_src = self.rc_src(rc_path=rc_file.name)
+                assert rc_src is not None
                 rc_file.write(rc_src)
             lines.append(f"source {rc_file.name}")
 
@@ -181,6 +259,7 @@ class TmuxMacro:
         if hasattr(self, 'macro_locals'):
             del self.macro_locals
 
+
 def capture_vars(frame: types.FrameType, names: List[str]) -> Dict[str, bytes]:
     """Captures the values of variables (by name) from the caller's scope.
 
@@ -211,6 +290,7 @@ def capture_vars(frame: types.FrameType, names: List[str]) -> Dict[str, bytes]:
     finally:
         # avoid reference cycles from holding onto the frame
         del frame
+
 
 def send(
     pane: libtmux.Pane,
