@@ -252,3 +252,79 @@ def test_tmuxs_unnamed_session_always_created(
     tmuxs()
 
     assert server.new_session_calls == [(None, "/usr/bin/xonsh")]
+
+
+def test_fstrings_parse_inside_with_bang_blocks(load_xontrib: Any) -> None:
+    load_xontrib("tmux")
+    from xonsh.execer import Execer  # type: ignore
+
+    execer = Execer()
+    code = (
+        "@aliases.register\n"
+        "def _triage(args):\n"
+        "    issue = args[0]\n"
+        "    with! tmuxs(f'gh-{issue}').send(capture=['issue']):\n"
+        "        prompt = f'Diagnose GitHub issue {issue!r} {issue:s}'\n"
+        "        gh issue view @(issue)\n"
+        "        with! tmuxp().send(capture=['issue']):\n"
+        "            f'leading fstring {issue=}'\n"
+        "            claude -c @(f'Diagnose GitHub issue {issue}')\n"
+    )
+    tree = execer.parse(code, ctx={})
+    assert tree is not None
+
+
+def test_captured_rc_src_suppresses_shell_history(
+    load_xontrib: Any, monkeypatch: Any
+) -> None:
+    import dill  # type: ignore
+    from xonsh.history.dummy import DummyHistory  # type: ignore
+    from xontrib_tmux.block import TmuxMacro  # type: ignore
+
+    load_xontrib("tmux")
+
+    class FakePtkHistory:
+        def __init__(self) -> None:
+            self._loaded_strings: List[str] = []
+
+        def append_string(self, s: str) -> None:
+            self._loaded_strings.insert(0, s)
+
+    hist = DummyHistory()
+    hist.inps = []
+
+    def record_append(cmd: Any) -> None:
+        if not hist.is_ignored(cmd):
+            hist.inps.append(cmd["inp"].rstrip())
+
+    monkeypatch.setattr(hist, "append", record_append)
+
+    ptk_hist = FakePtkHistory()
+    mock_xsh = MagicMock()
+    mock_xsh.history = hist
+    mock_xsh.shell.shell.history = ptk_hist
+    monkeypatch.setattr(builtins, "__xonsh__", mock_xsh, raising=False)
+
+    macro = TmuxMacro(MagicMock(), captured={"issue": dill.dumps("42")})
+    rc_bytes = macro.rc_src()
+    assert rc_bytes is not None
+
+    # Simulate prompt_toolkit adding the source line before BaseShell.default
+    # runs the script and calls hist.append in its finally block.
+    cmd_str = "source /tmp/captured_abc123.xsh"
+    ptk_hist.append_string("echo before")
+    ptk_hist.append_string(cmd_str)
+
+    ns: dict[str, Any] = {}
+    exec(rc_bytes.decode("utf-8"), ns)
+    assert ns["issue"] == "42"
+
+    hist.append({"inp": cmd_str + "\n", "rtn": 0})
+    # A subsequent user-typed command (even matching captured_*.xsh) must
+    # still be recorded in both histories.
+    user_source = "source /tmp/captured_user_typed.xsh"
+    ptk_hist.append_string(user_source)
+    hist.append({"inp": user_source + "\n", "rtn": 0})
+
+    assert hist.inps == [user_source]
+    assert ptk_hist._loaded_strings == [user_source, "echo before"]

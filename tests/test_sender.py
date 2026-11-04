@@ -127,3 +127,68 @@ def test_macro_enter_returns_before_keys_are_sent(gated_wait: Any) -> None:
         f"{PASTE_START}ls{PASTE_END}",
         f"{PASTE_START}echo hi{PASTE_END}",
     ]
+
+
+def test_macro_nested_indented_block_sends_trailing_paste_end(
+    gated_wait: Any,
+) -> None:
+    from xontrib_tmux.block import PASTE_END, PASTE_START, TmuxMacro  # type: ignore
+
+    gate, _ = gated_wait
+    pane = FakePane("%macro-nested")
+
+    macro = TmuxMacro(pane)
+    macro.macro_block = (
+        "# Open the issue details\n"
+        "gh issue view @(issue)\n"
+        "# Open claude in a separate panel\n"
+        "with! tmuxp().send(capture=['issue']):\n"
+        '    claude -c @(f"Diagnose GitHub issue {issue}")\n'
+    )
+    with macro:
+        pass
+    gate.set()
+    macro.future.result(timeout=5.0)
+    assert pane.sent == [
+        f"{PASTE_START}# Open the issue details{PASTE_END}",
+        f"{PASTE_START}gh issue view @(issue){PASTE_END}",
+        f"{PASTE_START}# Open claude in a separate panel{PASTE_END}",
+        f"{PASTE_START}with! tmuxp().send(capture=['issue']):",
+        '    claude -c @(f"Diagnose GitHub issue {issue}")',
+        PASTE_END,
+    ]
+
+
+def test_macro_compound_block_with_else_and_following_stmt(
+    gated_wait: Any,
+) -> None:
+    from xontrib_tmux.block import PASTE_END, PASTE_START, TmuxMacro  # type: ignore
+
+    gate, _ = gated_wait
+    pane = FakePane("%macro-compound")
+
+    macro = TmuxMacro(pane)
+    macro.macro_block = (
+        "if cond:\n"
+        "    a = 1\n"
+        "\n"
+        "    b = 2\n"
+        "else:\n"
+        "    a = 3\n"
+        "\n"
+        "echo done\n"
+    )
+    with macro:
+        pass
+    gate.set()
+    macro.future.result(timeout=5.0)
+    assert pane.sent == [
+        f"{PASTE_START}if cond:",
+        "    a = 1",
+        "",
+        "    b = 2",
+        "else:",
+        "    a = 3",
+        PASTE_END,
+        f"{PASTE_START}echo done{PASTE_END}",
+    ]

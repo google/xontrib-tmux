@@ -20,6 +20,11 @@ import libtmux  # type: ignore
 
 from .attach import attach
 from .block import send
+from .parser_patch import install_parser_patch_hook, patch_xonsh_parser
+
+
+install_parser_patch_hook()
+patch_xonsh_parser()
 
 
 def _send(

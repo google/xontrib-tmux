@@ -30,6 +30,78 @@ from .sender import deliver
 PASTE_START = "\x1b[200~"
 PASTE_END = "\x1b[201~"
 
+_CONTINUATION_RE = re.compile(
+    r"^(?:elif\b|else\s*:|except\b|finally\s*:|case\b|[)\]}])"
+)
+
+_HISTORY_SUPPRESS_PREAMBLE = """\
+def _xontrib_tmux_suppress_history():
+    import builtins
+    xsh = getattr(builtins, "__xonsh__", None)
+    if xsh is None:
+        return
+    hist = getattr(xsh, "history", None)
+    if hist is not None:
+        orig_append = hist.append
+        def _append_once(cmd, _orig=orig_append):
+            hist.append = _orig
+        hist.append = _append_once
+    ptk_hist = getattr(
+        getattr(getattr(xsh, "shell", None), "shell", None), "history", None
+    )
+    loaded = getattr(ptk_hist, "_loaded_strings", None)
+    if loaded and loaded[0].lstrip().startswith("source "):
+        del loaded[0]
+_xontrib_tmux_suppress_history()
+del _xontrib_tmux_suppress_history
+"""
+
+
+def _continues_block(current: List[str], next_line: str) -> bool:
+    """Returns True if ``next_line`` (non-blank) continues ``current``."""
+    if next_line[0] in (" ", "\t"):
+        return True
+    if _CONTINUATION_RE.match(next_line.lstrip()):
+        return True
+    for prev in reversed(current):
+        s = prev.strip()
+        if not s:
+            continue
+        if s.endswith("\\"):
+            return True
+        if s.startswith("@") and not s.startswith(("@(", "@$", "@!")):
+            return True
+        break
+    return False
+
+
+def _group_statements(raw_lines: List[str]) -> List[List[str]]:
+    """Groups lines into top-level single-line or multi-line statements."""
+    groups: List[List[str]] = []
+    current: List[str] = []
+    pending_blanks: List[str] = []
+
+    for line in raw_lines:
+        if not line.strip():
+            if current:
+                pending_blanks.append("")
+            continue
+
+        if current and _continues_block(current, line):
+            current.extend(pending_blanks)
+            pending_blanks.clear()
+            current.append(line)
+        else:
+            if current:
+                groups.append(current)
+            pending_blanks.clear()
+            current = [line]
+
+    if current:
+        groups.append(current)
+
+    return groups
+
 
 class TmuxMacro:
     """Context manager macro for sending code blocks to tmux panes."""
@@ -56,7 +128,7 @@ class TmuxMacro:
         if self.captured is None:
             return None
 
-        src = "import dill\n"
+        src = _HISTORY_SUPPRESS_PREAMBLE + "import dill\n"
         for var, pickled_val in self.captured.items():
             src += f"{var} = dill.loads({pickled_val})\n"
         src += "del dill\n"
@@ -76,13 +148,18 @@ class TmuxMacro:
 
         # strip comments off the macro block
         stripped = re.sub(
-            r'\s*#\d+:.*$', '', self.macro_block, flags=re.MULTILINE
+            r'[ \t]*#\d+:.*$', '', self.macro_block, flags=re.MULTILINE
         )
-        # Wrap text in paste codes to disable auto-indentation
-        lines.extend(
-            f"{PASTE_START}{line}{PASTE_END}"
-            for line in stripped.splitlines()
-        )
+        # Wrap single-line statements in paste codes, and wrap multi-line
+        # compound blocks across the whole block with a trailing PASTE_END
+        # line so the final Enter submits the indented block in xonsh.
+        for group in _group_statements(stripped.splitlines()):
+            if len(group) == 1:
+                lines.append(f"{PASTE_START}{group[0]}{PASTE_END}")
+            else:
+                lines.append(f"{PASTE_START}{group[0]}")
+                lines.extend(group[1:])
+                lines.append(PASTE_END)
         return lines
 
     def __enter__(self):

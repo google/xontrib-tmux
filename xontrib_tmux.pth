@@ -1,0 +1,1 @@
+import xontrib_tmux.parser_patch as _p; _p.install_parser_patch_hook()

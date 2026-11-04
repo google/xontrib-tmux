@@ -20,10 +20,14 @@ from typing import Any
 from .block import TmuxMacro
 from .commands import curtmuxp, curtmuxs, curtmuxw, tmuxp, tmuxs, tmuxw
 from .monkeypatch import *
+from .parser_patch import install_parser_patch_hook, patch_xonsh_parser
 
 
 def _load_xontrib_(xsh: Any, **kwargs: Any) -> None:
     """Loads the xontrib extension into the active xonsh session."""
+    install_parser_patch_hook()
+    patch_xonsh_parser()
+
     # Make convenience functions available at the top level of the shell
     xsh.ctx['tmuxw'] = tmuxw
     xsh.ctx['tmuxs'] = tmuxs
