@@ -268,7 +268,7 @@ def test_fstrings_parse_inside_with_bang_blocks(load_xontrib: Any) -> None:
         "        gh issue view @(issue)\n"
         "        with! tmuxp().send(capture=['issue']):\n"
         "            f'leading fstring {issue=}'\n"
-        "            claude -c @(f'Diagnose GitHub issue {issue}')\n"
+        "            agy -p @(f'Diagnose GitHub issue {issue}')\n"
     )
     tree = execer.parse(code, ctx={})
     assert tree is not None

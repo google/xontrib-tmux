@@ -15,7 +15,7 @@ def _triage(args):
         gh issue view @(issue)
         # Open claude in a separate panel
         with! tmuxp().send(capture=['issue']):
-            claude -c @(f"Diagnose GitHub issue {issue}")
+            agy -p @(f"Diagnose GitHub issue {issue}")
 ```
 
 ## Installation

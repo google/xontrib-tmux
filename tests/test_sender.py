@@ -141,9 +141,9 @@ def test_macro_nested_indented_block_sends_trailing_paste_end(
     macro.macro_block = (
         "# Open the issue details\n"
         "gh issue view @(issue)\n"
-        "# Open claude in a separate panel\n"
+        "# Open agy in a separate panel\n"
         "with! tmuxp().send(capture=['issue']):\n"
-        '    claude -c @(f"Diagnose GitHub issue {issue}")\n'
+        '    agy -p @(f"Diagnose GitHub issue {issue}")\n'
     )
     with macro:
         pass
@@ -152,9 +152,9 @@ def test_macro_nested_indented_block_sends_trailing_paste_end(
     assert pane.sent == [
         f"{PASTE_START}# Open the issue details{PASTE_END}",
         f"{PASTE_START}gh issue view @(issue){PASTE_END}",
-        f"{PASTE_START}# Open claude in a separate panel{PASTE_END}",
+        f"{PASTE_START}# Open agy in a separate panel{PASTE_END}",
         f"{PASTE_START}with! tmuxp().send(capture=['issue']):",
-        '    claude -c @(f"Diagnose GitHub issue {issue}")',
+        '    agy -p @(f"Diagnose GitHub issue {issue}")',
         PASTE_END,
     ]
 
