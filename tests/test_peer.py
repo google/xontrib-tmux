@@ -37,7 +37,6 @@ from xontrib_tmux.peer import (
     PeerMacro,
     RemoteXonsh,
     _PeerController,
-    _advance_active_ticket,
     _wait_ticket_turn,
 )
 from xontrib_tmux.protocol import (
@@ -49,7 +48,6 @@ from xontrib_tmux.protocol import (
     recv_json,
     send_json,
 )
-from xontrib_tmux.result import LastCmdProxy
 
 
 class _MockPeerServer:
@@ -148,33 +146,6 @@ def _short_sock(tmp_path: pathlib.Path, name: str = "p.sock") -> pathlib.Path:
     return pathlib.Path(f"/tmp/xt_test_{os.getpid()}_{name}")
 
 
-def _peer_from_ctrl(ctrl: _PeerController) -> RemoteXonsh:
-    """Builds a ``RemoteXonsh`` around an existing ``_PeerController``."""
-    peer = RemoteXonsh.__new__(RemoteXonsh)
-    peer._ctrl = ctrl
-    peer._socket_path = ctrl.socket_path
-    return peer
-
-
-def _peer_from_socket(
-    socket_path: pathlib.Path,
-    start_time: float,
-    *,
-    is_hidden: bool = False,
-    is_alive: Callable[[], bool] | None = None,
-    on_kill: Callable[[], None] | None = None,
-) -> RemoteXonsh:
-    """Builds a test ``RemoteXonsh`` wired directly to ``socket_path``."""
-    ctrl = _PeerController(
-        socket_path=socket_path,
-        start_time=start_time,
-        is_hidden=is_hidden,
-        is_alive=is_alive,
-        on_kill=on_kill,
-    )
-    return _peer_from_ctrl(ctrl)
-
-
 def test_send_string_and_record_false(tmp_path: pathlib.Path) -> None:
     sock = _short_sock(tmp_path, "send.sock")
 
@@ -199,7 +170,7 @@ def test_send_string_and_record_false(tmp_path: pathlib.Path) -> None:
 
     srv = _MockPeerServer(sock, handler).start()
     try:
-        peer = _peer_from_socket(sock, time.monotonic())
+        peer = RemoteXonsh._from_socket(sock, time.monotonic())
         r1 = peer.send("echo hi")
         assert r1.rtn == 0
         assert r1.out == "hi\n"
@@ -246,7 +217,7 @@ def test_with_bang_macro_and_plain_with_error(
 
     srv = _MockPeerServer(sock, handler).start()
     try:
-        peer = _peer_from_socket(sock, time.monotonic())
+        peer = RemoteXonsh._from_socket(sock, time.monotonic())
 
         macro = peer.send()
         assert isinstance(macro, PeerMacro)
@@ -270,7 +241,7 @@ def test_with_bang_macro_and_plain_with_error(
 
 def test_local_syntax_and_empty_validation(tmp_path: pathlib.Path) -> None:
     sock = _short_sock(tmp_path, "val.sock")
-    peer = _peer_from_socket(sock, time.monotonic())
+    peer = RemoteXonsh._from_socket(sock, time.monotonic())
 
     with pytest.raises(SyntaxError):
         peer.send("if True:\n")
@@ -280,6 +251,8 @@ def test_local_syntax_and_empty_validation(tmp_path: pathlib.Path) -> None:
         peer.send("   \n")
     with pytest.raises(TypeError):
         peer.send(123)  # type: ignore[arg-type]
+    with pytest.raises(NameError, match="x"):
+        peer.send("echo hi", capture=["x"])
 
 
 def test_fifo_ordering_across_concurrent_sends(tmp_path: pathlib.Path) -> None:
@@ -313,7 +286,7 @@ def test_fifo_ordering_across_concurrent_sends(tmp_path: pathlib.Path) -> None:
 
     srv = _MockPeerServer(sock, handler).start()
     try:
-        peer = _peer_from_socket(sock, time.monotonic())
+        peer = RemoteXonsh._from_socket(sock, time.monotonic())
         r1 = peer.send("echo first")
         r2 = peer.send("echo second")
         assert r2.out == "echo second\n"
@@ -336,19 +309,15 @@ def test_startup_holding_until_socket_bound(tmp_path: pathlib.Path) -> None:
                 "ok": True,
                 "rtn": 0,
                 "commands": [
-                    {
-                        "args": ["echo", "ready"],
-                        "rtn": 0,
-                        "out": "ready\n",
-                        "err": "",
-                    }
+                    {"args": ["echo", "ready"], "rtn": 0, "out": "ready\n",
+                     "err": ""}
                 ],
             },
         )
 
     srv = _MockPeerServer(sock, handler, bind_now=False).start()
     try:
-        peer = _peer_from_socket(sock, time.monotonic())
+        peer = RemoteXonsh._from_socket(sock, time.monotonic())
         assert "starting" in repr(peer)
         run = peer.send("echo ready")
         assert not run.future.done()
@@ -368,7 +337,7 @@ def test_fail_fast_on_err_sentinel_and_dead_process(
     err1 = pathlib.Path(f"{sock1}.err")
     err1.write_text("Peer not using prompt_toolkit\n", encoding="utf-8")
     try:
-        p1 = _peer_from_socket(sock1, time.monotonic())
+        p1 = RemoteXonsh._from_socket(sock1, time.monotonic())
         t0 = time.monotonic()
         r1 = p1.send("echo hi")
         with pytest.raises(RuntimeError, match="prompt_toolkit"):
@@ -379,7 +348,7 @@ def test_fail_fast_on_err_sentinel_and_dead_process(
 
     sock2 = _short_sock(tmp_path, "dead.sock")
     alive = True
-    p2 = _peer_from_socket(
+    p2 = RemoteXonsh._from_socket(
         sock2, time.monotonic(), is_alive=lambda: alive
     )
     t0 = time.monotonic()
@@ -395,7 +364,7 @@ def test_start_timeout_expires(
 ) -> None:
     sock = _short_sock(tmp_path, "timeout.sock")
     monkeypatch.setenv("XONTRIB_TMUX_READY_TIMEOUT", "0.05")
-    peer = _peer_from_socket(sock, time.monotonic() - 1.0)
+    peer = RemoteXonsh._from_socket(sock, time.monotonic() - 1.0)
     run = peer.send("echo late")
     with pytest.raises(RuntimeError, match="Timed out"):
         _ = run.rtn
@@ -422,7 +391,7 @@ def test_disconnect_mid_block_and_peer_error_response(
 
     srv = _MockPeerServer(sock, handler).start()
     try:
-        peer = _peer_from_socket(sock, time.monotonic())
+        peer = RemoteXonsh._from_socket(sock, time.monotonic())
         r_drop = peer.send("echo drop")
         with pytest.raises(RuntimeError, match="disconnected"):
             _ = r_drop.rtn
@@ -434,7 +403,7 @@ def test_disconnect_mid_block_and_peer_error_response(
         srv.close()
 
 
-def test_kill_fails_inflight_and_rejects_new_sends(
+def test_kill_fails_inflight_sends_kill_op_and_rejects_new_sends(
     tmp_path: pathlib.Path,
 ) -> None:
     sock = _short_sock(tmp_path, "kill.sock")
@@ -444,18 +413,23 @@ def test_kill_fails_inflight_and_rejects_new_sends(
 
     in_handler = threading.Event()
     release = threading.Event()
+    kill_seen = threading.Event()
 
     def handler(conn: socket.socket, req: dict[str, Any]) -> None:
+        if req.get("op") == "kill":
+            kill_seen.set()
+            return
         in_handler.set()
         release.wait(timeout=2.0)
 
     srv = _MockPeerServer(sock, handler).start()
     try:
-        peer = _peer_from_socket(sock, time.monotonic())
+        peer = RemoteXonsh._from_socket(sock, time.monotonic())
         pending = peer.send("sleep 10")
         assert in_handler.wait(timeout=1.0)
 
         peer.kill()
+        assert kill_seen.wait(timeout=1.0)
         assert "killed" in repr(peer)
         assert not sock.exists()
         with pytest.raises(RuntimeError, match="Peer exited"):
@@ -473,10 +447,9 @@ def test_kill_fails_inflight_and_rejects_new_sends(
 def test_context_manager_kills_on_exit(tmp_path: pathlib.Path) -> None:
     killed_called = threading.Event()
     sock = _short_sock(tmp_path, "ctxmgr.sock")
-    peer = _peer_from_socket(
+    peer = RemoteXonsh._from_socket(
         sock,
         time.monotonic(),
-        is_hidden=True,
         is_alive=lambda: True,
         on_kill=killed_called.set,
     )
@@ -484,6 +457,23 @@ def test_context_manager_kills_on_exit(tmp_path: pathlib.Path) -> None:
         assert ctx_peer is peer
         assert not killed_called.is_set()
     assert killed_called.wait(timeout=1.0)
+
+    # Dropping a non-hidden _from_socket peer must NOT kill it.
+    non_hidden_killed = False
+
+    def _k() -> None:
+        nonlocal non_hidden_killed
+        non_hidden_killed = True
+
+    p2 = RemoteXonsh._from_socket(
+        _short_sock(tmp_path, "nonhidden.sock"),
+        time.monotonic(),
+        is_alive=lambda: True,
+        on_kill=_k,
+    )
+    del p2
+    gc.collect()
+    assert non_hidden_killed is False
 
 
 def test_hidden_peer_lifetime_kept_alive_by_pending_result(
@@ -516,7 +506,7 @@ def test_hidden_peer_lifetime_kept_alive_by_pending_result(
             is_alive=lambda: True,
             on_kill=lambda: kill_events.append("killed"),
         )
-        peer = _peer_from_ctrl(ctrl)
+        peer = RemoteXonsh._from_controller(ctrl)
         del ctrl
         res = peer.send("echo ok")
         del peer
@@ -542,7 +532,7 @@ def test_repr_and_tab_completion_never_block(
 ) -> None:
     del xonsh_execer
     sock = _short_sock(tmp_path, "comp.sock")
-    peer = _peer_from_socket(sock, time.monotonic())
+    peer = RemoteXonsh._from_socket(sock, time.monotonic())
     t0 = time.monotonic()
     text = repr(peer)
     comps = attr_complete("peer.", {"peer": peer}, lambda o, a: o.startswith(a))
@@ -694,7 +684,7 @@ def test_kill_and_second_send_do_not_block_while_starting(
     tmp_path: pathlib.Path,
 ) -> None:
     sock = _short_sock(tmp_path, "nonblock_kill.sock")
-    peer = _peer_from_socket(sock, time.monotonic())
+    peer = RemoteXonsh._from_socket(sock, time.monotonic())
 
     t0 = time.monotonic()
     r1 = peer.send("echo 1")
@@ -729,7 +719,7 @@ def test_post_ready_exit_fails_immediately_without_startup_timeout(
 
     srv = _MockPeerServer(sock, handler).start()
     try:
-        peer = _peer_from_socket(sock, time.monotonic())
+        peer = RemoteXonsh._from_socket(sock, time.monotonic())
         assert peer.send("echo 1").rtn == 0
     finally:
         srv.close()
@@ -739,186 +729,6 @@ def test_post_ready_exit_fails_immediately_without_startup_timeout(
     with pytest.raises(RuntimeError, match="Peer exited"):
         _ = r2.rtn
     assert time.monotonic() - t0 < 0.2
-
-
-def test_abandoned_ticket_does_not_stall_later_waiters(
-    tmp_path: pathlib.Path,
-) -> None:
-    sock = _short_sock(tmp_path, "ticket_abandon.sock")
-    ctrl = _PeerController(
-        socket_path=sock,
-        start_time=time.monotonic(),
-        is_hidden=False,
-        is_alive=lambda: True,
-    )
-    with ctrl.lock:
-        t0 = ctrl.next_ticket
-        ctrl.next_ticket += 1
-        t1 = ctrl.next_ticket
-        ctrl.next_ticket += 1
-        t2 = ctrl.next_ticket
-        ctrl.next_ticket += 1
-    assert (t0, t1, t2) == (0, 1, 2)
-
-    # Simulate t1 interrupting while waiting for t0.
-    t1_done = threading.Event()
-    original_wait = ctrl.send_cond.wait
-
-    def _interrupt_t1() -> None:
-        ctrl.send_cond.wait = lambda *a, **kw: (  # type: ignore[method-assign]
-            (_ for _ in ()).throw(KeyboardInterrupt())
-        )
-        try:
-            with pytest.raises(KeyboardInterrupt):
-                _wait_ticket_turn(ctrl, t1)
-        finally:
-            ctrl.send_cond.wait = original_wait  # type: ignore[method-assign]
-            t1_done.set()
-
-    th1 = threading.Thread(target=_interrupt_t1)
-    th1.start()
-    assert t1_done.wait(timeout=1.0)
-    th1.join(timeout=1.0)
-
-    t2_done = threading.Event()
-
-    def _wait_t2() -> None:
-        _wait_ticket_turn(ctrl, t2)
-        t2_done.set()
-
-    th2 = threading.Thread(target=_wait_t2)
-    th2.start()
-
-    with ctrl.send_cond:
-        _advance_active_ticket(ctrl)
-    assert t2_done.wait(timeout=1.0)
-    th2.join(timeout=1.0)
-
-
-def test_future_cancel_local_and_peer_arbitrated(
-    tmp_path: pathlib.Path,
-) -> None:
-    # 1. Local cancel while still holding before socket exists.
-    unready_sock = _short_sock(tmp_path, "unready_cancel.sock")
-    ctrl = _PeerController(
-        socket_path=unready_sock,
-        start_time=time.monotonic(),
-        is_hidden=False,
-        is_alive=lambda: True,
-    )
-    unready_peer = _peer_from_ctrl(ctrl)
-    try:
-        r_local = unready_peer.send("echo never-sent")
-        assert r_local.future.cancel() is True
-        with pytest.raises(CancelledError):
-            _ = r_local.rtn
-    finally:
-        unready_peer.kill()
-
-    # 2. Dead peer returns False on cancel.
-    dead_sock = _short_sock(tmp_path, "dead_cancel.sock")
-    dead_ctrl = _PeerController(
-        socket_path=dead_sock,
-        start_time=time.monotonic(),
-        is_hidden=False,
-        is_alive=lambda: False,
-    )
-    dead_peer = _peer_from_ctrl(dead_ctrl)
-    r_dead = dead_peer.send("echo dead")
-    assert r_dead.future.cancel() is False
-    try:
-        _ = r_dead.rtn
-    except RuntimeError:
-        pass
-
-    # 2b. Startup .err sentinel returns False on cancel even while queued.
-    err_sock = _short_sock(tmp_path, "err_cancel.sock")
-    pathlib.Path(f"{err_sock}.err").write_text("bad rc", encoding="utf-8")
-    err_ctrl = _PeerController(
-        socket_path=err_sock,
-        start_time=time.monotonic(),
-        is_hidden=False,
-        is_alive=lambda: True,
-    )
-    err_peer = _peer_from_ctrl(err_ctrl)
-    r_err = err_peer.send("echo err")
-    assert r_err.future.cancel() is False
-    with pytest.raises(RuntimeError, match="bad rc"):
-        _ = r_err.rtn
-    pathlib.Path(f"{err_sock}.err").unlink(missing_ok=True)
-
-    # 3. Peer-arbitrated cancel round-trip (accepted vs rejected).
-    sock = _short_sock(tmp_path, "cancel_rt.sock")
-    run_conns: dict[str, socket.socket] = {}
-    run_reqs: dict[str, dict[str, Any]] = {}
-    run_seen = threading.Event()
-    allow_finish = threading.Event()
-
-    def handler(conn: socket.socket, req: dict[str, Any]) -> None:
-        op = req["op"]
-        if op == "run":
-            run_reqs[req["id"]] = req
-            run_conns[req["id"]] = conn
-            run_seen.set()
-            if req["block"].strip() == "echo running":
-                allow_finish.wait(timeout=2.0)
-                send_json(
-                    conn,
-                    {
-                        "id": req["id"],
-                        "ok": True,
-                        "rtn": 0,
-                        "commands": [
-                            {
-                                "args": ["echo", "running"],
-                                "rtn": 0,
-                                "out": "running\n",
-                                "err": "",
-                            }
-                        ],
-                    },
-                )
-            else:
-                allow_finish.wait(timeout=2.0)
-        elif op == "cancel":
-            target_id = req["target_id"]
-            target_req = run_reqs.get(target_id)
-            if target_req and target_req["block"].strip() == "echo queued":
-                target_conn = run_conns[target_id]
-                send_json(
-                    target_conn,
-                    {"id": target_id, "ok": False, "cancelled": True},
-                )
-                send_json(
-                    conn,
-                    {"id": req["id"], "ok": True, "cancelled": True},
-                )
-            else:
-                send_json(
-                    conn,
-                    {"id": req["id"], "ok": True, "cancelled": False},
-                )
-
-    srv = _MockPeerServer(sock, handler).start()
-    try:
-        peer = _peer_from_socket(sock, time.monotonic())
-        running = peer.send("echo running")
-        assert run_seen.wait(timeout=1.0)
-        run_seen.clear()
-        queued = peer.send("echo queued")
-        assert run_seen.wait(timeout=1.0)
-
-        assert running.future.cancel() is False
-        assert queued.future.cancel() is True
-
-        allow_finish.set()
-        assert running.rtn == 0
-        assert running.out == "running\n"
-        with pytest.raises(CancelledError):
-            _ = queued.rtn
-    finally:
-        allow_finish.set()
-        srv.close()
 
 
 def test_env_and_ctx_proxies_and_lastcmd_round_trip(
@@ -997,7 +807,7 @@ def test_env_and_ctx_proxies_and_lastcmd_round_trip(
 
     srv = _MockPeerServer(sock, handler).start()
     try:
-        peer = _peer_from_socket(sock, time.monotonic())
+        peer = RemoteXonsh._from_socket(sock, time.monotonic())
         t0 = time.monotonic()
         assert isinstance(peer.env, EnvProxy)
         assert isinstance(peer.env, MutableMapping)
@@ -1073,6 +883,184 @@ def test_env_and_ctx_proxies_and_lastcmd_round_trip(
         srv.close()
 
 
+def test_capture_in_string_and_macro_forms(tmp_path: pathlib.Path) -> None:
+    sock = _short_sock(tmp_path, "capture.sock")
+    seen_reqs: list[dict[str, Any]] = []
+
+    def handler(conn: socket.socket, req: dict[str, Any]) -> None:
+        seen_reqs.append(req)
+        send_json(
+            conn,
+            {
+                "id": req["id"],
+                "ok": True,
+                "rtn": 0,
+                "commands": [],
+            },
+        )
+
+    srv = _MockPeerServer(sock, handler).start()
+    try:
+        peer = RemoteXonsh._from_socket(sock, time.monotonic())
+        local_var = {"count": 3, "label": "items"}
+
+        res1 = peer.send("echo hi", capture=["local_var"])
+        assert res1.rtn == 0
+
+        macro = peer.send(capture=["local_var"])
+        assert isinstance(macro, PeerMacro)
+        macro.macro_block = "echo from-macro\n"
+        macro.macro_globals = {}
+        macro.macro_locals = {}
+        with macro as res2:
+            assert res2.rtn == 0
+
+        assert len(seen_reqs) == 2
+        assert decode_captured(seen_reqs[0]["captured"]) == {
+            "local_var": {"count": 3, "label": "items"}
+        }
+        assert decode_captured(seen_reqs[1]["captured"]) == {
+            "local_var": {"count": 3, "label": "items"}
+        }
+
+        with pytest.raises(NameError, match="no_such_var"):
+            peer.send("echo hi", capture=["no_such_var"])
+        unpicklable = (i for i in range(3))
+        with pytest.raises(TypeError):
+            peer.send("echo hi", capture=["unpicklable"])
+        with pytest.raises(TypeError):
+            peer.send("echo hi", capture="local_var")  # type: ignore[arg-type]
+        assert len(seen_reqs) == 2
+    finally:
+        srv.close()
+
+
+def test_future_cancel_local_and_peer_arbitrated(
+    tmp_path: pathlib.Path,
+) -> None:
+    # 1. Local cancel while still holding before socket exists.
+    unready_sock = _short_sock(tmp_path, "unready_cancel.sock")
+    ctrl = _PeerController(
+        socket_path=unready_sock,
+        start_time=time.monotonic(),
+        is_hidden=False,
+        is_alive=lambda: True,
+    )
+    unready_peer = RemoteXonsh._from_controller(ctrl)
+    try:
+        r_local = unready_peer.send("echo never-sent")
+        assert r_local.future.cancel() is True
+        with pytest.raises(CancelledError):
+            _ = r_local.rtn
+    finally:
+        unready_peer.kill()
+
+    # 2. Dead peer returns False on cancel.
+    dead_sock = _short_sock(tmp_path, "dead_cancel.sock")
+    dead_ctrl = _PeerController(
+        socket_path=dead_sock,
+        start_time=time.monotonic(),
+        is_hidden=False,
+        is_alive=lambda: False,
+    )
+    dead_peer = RemoteXonsh._from_controller(dead_ctrl)
+    r_dead = dead_peer.send("echo dead")
+    assert r_dead.future.cancel() is False
+    try:
+        _ = r_dead.rtn
+    except RuntimeError:
+        pass
+
+    # 2b. Startup .err sentinel returns False on cancel even while queued.
+    err_sock = _short_sock(tmp_path, "err_cancel.sock")
+    pathlib.Path(f"{err_sock}.err").write_text("bad rc", encoding="utf-8")
+    err_ctrl = _PeerController(
+        socket_path=err_sock,
+        start_time=time.monotonic(),
+        is_hidden=False,
+        is_alive=lambda: True,
+    )
+    err_peer = RemoteXonsh._from_controller(err_ctrl)
+    r_err = err_peer.send("echo err")
+    assert r_err.future.cancel() is False
+    with pytest.raises(RuntimeError, match="bad rc"):
+        _ = r_err.rtn
+    pathlib.Path(f"{err_sock}.err").unlink(missing_ok=True)
+
+    # 3. Peer-arbitrated cancel round-trip (accepted vs rejected).
+    sock = _short_sock(tmp_path, "cancel_rt.sock")
+    run_conns: dict[str, socket.socket] = {}
+    run_reqs: dict[str, dict[str, Any]] = {}
+    run_seen = threading.Event()
+    allow_finish = threading.Event()
+
+    def handler(conn: socket.socket, req: dict[str, Any]) -> None:
+        op = req["op"]
+        if op == "run":
+            run_reqs[req["id"]] = req
+            run_conns[req["id"]] = conn
+            run_seen.set()
+            if req["block"].strip() == "echo running":
+                allow_finish.wait(timeout=2.0)
+                send_json(
+                    conn,
+                    {
+                        "id": req["id"],
+                        "ok": True,
+                        "rtn": 0,
+                        "commands": [
+                            {
+                                "args": ["echo", "running"],
+                                "rtn": 0,
+                                "out": "running\n",
+                                "err": "",
+                            }
+                        ],
+                    },
+                )
+            else:
+                allow_finish.wait(timeout=2.0)
+        elif op == "cancel":
+            target_id = req["target_id"]
+            target_req = run_reqs.get(target_id)
+            if target_req and target_req["block"].strip() == "echo queued":
+                target_conn = run_conns[target_id]
+                send_json(
+                    target_conn,
+                    {"id": target_id, "ok": False, "cancelled": True},
+                )
+                send_json(
+                    conn,
+                    {"id": req["id"], "ok": True, "cancelled": True},
+                )
+            else:
+                send_json(
+                    conn,
+                    {"id": req["id"], "ok": True, "cancelled": False},
+                )
+
+    srv = _MockPeerServer(sock, handler).start()
+    try:
+        peer = RemoteXonsh._from_socket(sock, time.monotonic())
+        running = peer.send("echo running")
+        assert run_seen.wait(timeout=1.0)
+        run_seen.clear()
+        queued = peer.send("echo queued")
+        assert run_seen.wait(timeout=1.0)
+
+        assert running.future.cancel() is False
+        assert queued.future.cancel() is True
+
+        allow_finish.set()
+        assert running.rtn == 0
+        assert running.out == "running\n"
+        with pytest.raises(CancelledError):
+            _ = queued.rtn
+    finally:
+        allow_finish.set()
+        srv.close()
+
+
 def test_self_send_and_self_wait_guard(
     monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
 ) -> None:
@@ -1124,7 +1112,7 @@ def test_self_send_and_self_wait_guard(
             peer_server_mod, "current_peer_socket_path", lambda: str(sock)
         )
         # Connect via symlink to verify realpath comparison.
-        self_peer = _peer_from_socket(link_sock, time.monotonic())
+        self_peer = RemoteXonsh._from_socket(link_sock, time.monotonic())
 
         # Sending from main thread inside peer is allowed and queued.
         hold_res = self_peer.send("echo hi")
@@ -1142,7 +1130,7 @@ def test_self_send_and_self_wait_guard(
             is_hidden=False,
             is_alive=lambda: True,
         )
-        blocked_peer = _peer_from_ctrl(unready_ctrl)
+        blocked_peer = RemoteXonsh._from_controller(unready_ctrl)
         pending = blocked_peer._submit_block("echo later")
         try:
             with pytest.raises(RuntimeError, match="own peer"):
@@ -1199,53 +1187,57 @@ def test_self_send_and_self_wait_guard(
         srv.close()
 
 
-def test_capture_in_string_and_macro_forms(tmp_path: pathlib.Path) -> None:
-    sock = _short_sock(tmp_path, "capture.sock")
-    seen_reqs: list[dict[str, Any]] = []
+def test_abandoned_ticket_does_not_stall_later_waiters(
+    tmp_path: pathlib.Path,
+) -> None:
+    sock = _short_sock(tmp_path, "ticket_abandon.sock")
+    ctrl = _PeerController(
+        socket_path=sock,
+        start_time=time.monotonic(),
+        is_hidden=False,
+        is_alive=lambda: True,
+    )
+    with ctrl.lock:
+        t0 = ctrl.next_ticket
+        ctrl.next_ticket += 1
+        t1 = ctrl.next_ticket
+        ctrl.next_ticket += 1
+        t2 = ctrl.next_ticket
+        ctrl.next_ticket += 1
+    assert (t0, t1, t2) == (0, 1, 2)
 
-    def handler(conn: socket.socket, req: dict[str, Any]) -> None:
-        seen_reqs.append(req)
-        send_json(
-            conn,
-            {
-                "id": req["id"],
-                "ok": True,
-                "rtn": 0,
-                "commands": [],
-            },
+    # Simulate t1 interrupting while waiting for t0.
+    t1_done = threading.Event()
+    original_wait = ctrl.send_cond.wait
+
+    def _interrupt_t1() -> None:
+        ctrl.send_cond.wait = lambda *a, **kw: (  # type: ignore[method-assign]
+            (_ for _ in ()).throw(KeyboardInterrupt())
         )
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                _wait_ticket_turn(ctrl, t1)
+        finally:
+            ctrl.send_cond.wait = original_wait  # type: ignore[method-assign]
+            t1_done.set()
 
-    srv = _MockPeerServer(sock, handler).start()
-    try:
-        peer = _peer_from_socket(sock, time.monotonic())
-        local_var = {"count": 3, "label": "items"}
+    th1 = threading.Thread(target=_interrupt_t1)
+    th1.start()
+    assert t1_done.wait(timeout=1.0)
+    th1.join(timeout=1.0)
 
-        res1 = peer.send("echo hi", capture=["local_var"])
-        assert res1.rtn == 0
+    t2_done = threading.Event()
 
-        macro = peer.send(capture=["local_var"])
-        assert isinstance(macro, PeerMacro)
-        macro.macro_block = "echo from-macro\n"
-        macro.macro_globals = {}
-        macro.macro_locals = {}
-        with macro as res2:
-            assert res2.rtn == 0
+    def _wait_t2() -> None:
+        _wait_ticket_turn(ctrl, t2)
+        t2_done.set()
 
-        assert len(seen_reqs) == 2
-        assert decode_captured(seen_reqs[0]["captured"]) == {
-            "local_var": {"count": 3, "label": "items"}
-        }
-        assert decode_captured(seen_reqs[1]["captured"]) == {
-            "local_var": {"count": 3, "label": "items"}
-        }
+    th2 = threading.Thread(target=_wait_t2)
+    th2.start()
 
-        with pytest.raises(NameError, match="no_such_var"):
-            peer.send("echo hi", capture=["no_such_var"])
-        unpicklable = (i for i in range(3))
-        with pytest.raises(TypeError):
-            peer.send("echo hi", capture=["unpicklable"])
-        with pytest.raises(TypeError):
-            peer.send("echo hi", capture="local_var")  # type: ignore[arg-type]
-        assert len(seen_reqs) == 2
-    finally:
-        srv.close()
+    from xontrib_tmux.peer import _advance_active_ticket
+
+    with ctrl.send_cond:
+        _advance_active_ticket(ctrl)
+    assert t2_done.wait(timeout=1.0)
+    th2.join(timeout=1.0)

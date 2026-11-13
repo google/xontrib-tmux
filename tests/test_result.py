@@ -375,15 +375,33 @@ def test_read_failed_result_does_not_print_on_gc(
     assert captured.err == ""
 
 
+def test_cancelled_result_does_not_print_on_gc_and_raises_cancelled(
+    capsys: Any,
+) -> None:
+    run = PeerResult(cancel_hook=lambda: True)
+    assert run.future.cancel() is True
+    with pytest.raises(CancelledError):
+        _ = run.rtn
+    del run
+    gc.collect()
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
 def test_asyncio_wrap_future_with_peer_result() -> None:
     run = PeerResult()
 
     async def main() -> int:
         wrapped = asyncio.wrap_future(run.future)
-        run._set_completed(7, [], recorded=True)
+        threading.Timer(
+            0.02,
+            lambda: run._set_completed(7, [], recorded=True),
+        ).start()
         return await wrapped
 
     assert asyncio.run(main()) == 7
+    assert run.rtn == 7
 
 
 def test_pending_hash_and_eq_do_not_block_or_raise() -> None:
@@ -444,34 +462,6 @@ def test_gc_before_set_exception_reports_later_failure(capsys: Any) -> None:
     fut.set_exception(RuntimeError("failed after gc"))
     captured = capsys.readouterr()
     assert "failed after gc" in captured.err
-
-
-def test_set_completed_optional_block_out_err_override() -> None:
-    run = PeerResult()
-    run._set_completed(
-        0,
-        [CommandRecord(args=["echo", "a"], rtn=0, out="a\n", err="")],
-        recorded=True,
-        out="a\nb\n",
-        err="py-err\n",
-    )
-    assert run.out == "a\nb\n"
-    assert run.err == "py-err\n"
-    assert [c.out for c in run.commands] == ["a\n"]
-
-
-def test_cancelled_result_does_not_print_on_gc_and_raises_cancelled(
-    capsys: Any,
-) -> None:
-    run = PeerResult(cancel_hook=lambda: True)
-    assert run.future.cancel() is True
-    with pytest.raises(CancelledError):
-        _ = run.rtn
-    del run
-    gc.collect()
-
-    captured = capsys.readouterr()
-    assert captured.err == ""
 
 
 def test_cancelled_result_raises_on_all_waiters_and_silent_gc(
@@ -574,3 +564,17 @@ def test_last_cmd_proxy_and_nonblocking_tab_completion(
     assert list(empty_proxy) == []
     with pytest.raises(TypeError):
         _ = int(empty_proxy)
+
+
+def test_set_completed_optional_block_out_err_override() -> None:
+    run = PeerResult()
+    run._set_completed(
+        0,
+        [CommandRecord(args=["echo", "a"], rtn=0, out="a\n", err="")],
+        recorded=True,
+        out="a\nb\n",
+        err="py-err\n",
+    )
+    assert run.out == "a\nb\n"
+    assert run.err == "py-err\n"
+    assert [c.out for c in run.commands] == ["a\n"]

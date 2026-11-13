@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 import io
 import os
 import selectors
+import signal
 import socket
 import subprocess
 import sys
@@ -312,6 +313,14 @@ def _send_reply(
             send_json(conn, msg)
         except (BrokenPipeError, OSError):
             pass
+
+
+def _kill_current_peer() -> None:
+    """Terminates the peer process group on a ``kill`` request."""
+    try:
+        os.killpg(os.getpgrp(), signal.SIGKILL)
+    except OSError:
+        os._exit(0)
 
 
 def _install_global_hooks() -> None:
@@ -1043,13 +1052,21 @@ class _PeerServer:
             self._drop_conn(conn)
             return
 
-        if not self._dispatch_request(req, conn, send_lock, pending_events):
-            self._drop_conn(conn)
-            return
+        initial_kill = req.get("op") == "kill" and self.reject_reason is None
+        if not initial_kill:
+            if not self._dispatch_request(req, conn, send_lock, pending_events):
+                self._drop_conn(conn)
+                return
 
         t = threading.Thread(
             target=self._handle_client,
-            args=(conn, send_lock, pending_events, leftover),
+            args=(
+                conn,
+                send_lock,
+                pending_events,
+                leftover,
+                req if initial_kill else None,
+            ),
             name="xontrib-tmux-peer-client",
             daemon=True,
         )
@@ -1076,7 +1093,12 @@ class _PeerServer:
             )
             return True
         op = req.get("op")
-        if op == "cancel":
+        if op == "kill":
+            _send_reply(conn, send_lock, {"id": req_id, "ok": True})
+            self.stop()
+            _kill_current_peer()
+            return False
+        elif op == "cancel":
             self._handle_cancel(
                 req_id, req.get("target_id"), conn, send_lock
             )
@@ -1134,6 +1156,7 @@ class _PeerServer:
         send_lock: threading.Lock | None = None,
         pending_events: list[threading.Event] | None = None,
         leftover: bytes = b"",
+        initial_req: dict[str, Any] | None = None,
     ) -> None:
         if send_lock is None:
             send_lock = threading.Lock()
@@ -1141,6 +1164,11 @@ class _PeerServer:
             pending_events = []
         buf = bytearray(leftover)
         try:
+            if initial_req is not None:
+                if not self._dispatch_request(
+                    initial_req, conn, send_lock, pending_events
+                ):
+                    return
             with conn.makefile("rb") as rb:
                 while not self._stop_event.is_set():
                     nl = buf.find(b"\n")

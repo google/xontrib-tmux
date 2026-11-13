@@ -270,11 +270,9 @@ def _patch_base_parser() -> None:
     parser_obj = getattr(getattr(xsh, "execer", None), "parser", None)
     lr_parser = getattr(parser_obj, "parser", None)
     for prod in getattr(lr_parser, "productions", None) or ():
-        if (
-            getattr(prod, "name", None) == "rawsuite"
-            and getattr(getattr(prod, "func", None), "__name__", None)
-            == "p_rawsuite_indent"
-        ):
+        if getattr(prod, "name", None) == "rawsuite" and getattr(
+            getattr(prod, "func", None), "__name__", None
+        ) == "p_rawsuite_indent":
             prod.func = p_rawsuite_indent.__get__(
                 parser_obj, type(parser_obj)
             )
@@ -380,9 +378,7 @@ class _ParserTableImportHook(MetaPathFinder, Loader):
                         def create_module(
                             self, s: ModuleSpec
                         ) -> Optional[ModuleType]:
-                            create = getattr(
-                                orig_loader, "create_module", None
-                            )
+                            create = getattr(orig_loader, "create_module", None)
                             return create(s) if create is not None else None
 
                         def exec_module(self, module: ModuleType) -> None:

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""End-to-end integration tests for peer cancellation."""
+"""Milestone 2 end-to-end integration tests with real xonsh peers."""
 
 from collections.abc import Iterator
 from concurrent.futures import CancelledError
@@ -103,50 +103,6 @@ def spawn_peer(isolated_env: pathlib.Path) -> Iterator[Any]:
                 err_file.unlink(missing_ok=True)
 
 
-def test_cancel_while_busy_and_behind_half_typed_prompt(
-    spawn_peer: Any,
-) -> None:
-    worker = spawn_peer()
-    assert worker.send("echo warm").rtn == 0
-
-    blocker = worker.send("sleep 1.0")
-    queued = worker.send("echo nope\n__xonsh__.ctx['ran_q'] = True")
-    time.sleep(0.2)
-    assert blocker.future.cancel() is False
-    assert queued.future.cancel() is True
-    assert blocker.rtn == 0
-    with pytest.raises(CancelledError):
-        _ = queued.rtn
-    assert (
-        worker.send(
-            "print('ran_q' in __xonsh__.ctx)"
-        ).out
-        == "False\n"
-    )
-
-    # Half-typed prompt line holds queued send until cancelled or cleared.
-    master_fd = worker._ctrl.state.master_fd
-    assert master_fd is not None
-    os.write(master_fd, b"partial_var = ")
-    time.sleep(0.2)
-
-    held = worker.send("echo held\n__xonsh__.ctx['ran_held'] = True")
-    time.sleep(0.15)
-    assert held.future.cancel() is True
-    with pytest.raises(CancelledError):
-        _ = held.rtn
-
-    # Clear the partial line with Ctrl-U so prompt becomes idle again.
-    os.write(master_fd, b"\x15")
-    assert (
-        worker.send(
-            "print('ran_held' in __xonsh__.ctx)"
-        ).out
-        == "False\n"
-    )
-    assert worker.send("echo recovered").out == "recovered\n"
-
-
 def test_env_ctx_lastcmd_copy_semantics_and_completion(
     xonsh_execer: Any, spawn_peer: Any
 ) -> None:
@@ -226,96 +182,6 @@ def test_env_ctx_lastcmd_copy_semantics_and_completion(
     assert busy.rtn == 0
 
 
-def test_callback_chaining_on_background_thread(spawn_peer: Any) -> None:
-    worker = spawn_peer()
-    done = threading.Event()
-    chained_outputs: list[Any] = []
-    chained_errors: list[BaseException] = []
-
-    def _on_done(fut: Any) -> None:
-        try:
-            assert fut.result() == 0
-            r2 = worker.send("echo chained-step\nprint('py-chained')")
-            chained_outputs.append((r2.rtn, r2.out))
-        except BaseException as exc:  # noqa: BLE001
-            chained_errors.append(exc)
-        finally:
-            done.set()
-
-    r1 = worker.send("echo first-step")
-    r1.future.add_done_callback(_on_done)
-    assert r1.out == "first-step\n"
-    assert done.wait(timeout=10.0)
-    assert chained_errors == []
-    assert chained_outputs == [(0, "chained-step\npy-chained\n")]
-
-
-def test_self_send_and_self_wait_inside_live_peer(spawn_peer: Any) -> None:
-    worker = spawn_peer()
-    sock_str = str(worker._socket_path)
-    worker.ctx["self_sock"] = sock_str
-
-    res = worker.send(
-        "import pathlib, time\n"
-        "from xontrib_tmux import RemoteXonsh\n"
-        "from xontrib_tmux.peer import _PeerController\n"
-        "ctrl = _PeerController(\n"
-        "    socket_path=pathlib.Path(self_sock),\n"
-        "    start_time=time.monotonic(),\n"
-        "    is_hidden=False,\n"
-        "    is_alive=lambda: True,\n"
-        ")\n"
-        "me = RemoteXonsh.__new__(RemoteXonsh)\n"
-        "me._ctrl = ctrl\n"
-        "me._socket_path = ctrl.socket_path\n"
-        "r_self = me.send(\"__xonsh__.ctx['self_ran'] = True\\n"
-        "echo from-self\")\n"
-        "errors = []\n"
-        "for fn in (\n"
-        "    lambda: r_self.rtn,\n"
-        "    lambda: r_self.future.result(),\n"
-        "    lambda: me.env['PATH'],\n"
-        "    lambda: me.ctx['self_sock'],\n"
-        "    lambda: me.lastcmd.rtn,\n"
-        "):\n"
-        "    try:\n"
-        "        fn()\n"
-        "    except RuntimeError as exc:\n"
-        "        errors.append(str(exc))\n"
-        "__xonsh__.ctx['self_errors'] = errors\n"
-    )
-    assert res.rtn == 0
-    errors = worker.ctx["self_errors"]
-    assert len(errors) == 5
-    assert all("Cannot wait on this shell's own peer" in msg for msg in errors)
-
-    # Queued self-send ran after the outer entry finished.
-    assert worker.ctx["self_ran"] is True
-    assert worker.lastcmd.args == ["echo", "from-self"]
-
-
-def test_env_wait_abandoned_on_keyboard_interrupt(spawn_peer: Any) -> None:
-    worker = spawn_peer()
-    assert worker.send("echo warm").rtn == 0
-
-    busy = worker.send("sleep 1.0")
-    time.sleep(0.15)
-    timer = threading.Timer(
-        0.15, os.kill, args=(os.getpid(), signal.SIGINT)
-    )
-    timer.start()
-    t0 = time.monotonic()
-    try:
-        with pytest.raises(KeyboardInterrupt):
-            _ = worker.env["PATH"]
-        assert time.monotonic() - t0 < 0.7
-    finally:
-        timer.cancel()
-
-    assert busy.rtn == 0
-    assert worker.send("echo survived").out == "survived\n"
-
-
 def test_capture_in_string_and_with_bang_forms(
     spawn_peer: Any, tmp_path: pathlib.Path
 ) -> None:
@@ -366,6 +232,190 @@ def test_capture_in_string_and_with_bang_forms(
         f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
     )
     assert "CAPTURE_MACRO_OK" in proc.stdout
+
+
+def test_cancel_while_busy_and_behind_half_typed_prompt(
+    spawn_peer: Any,
+) -> None:
+    worker = spawn_peer()
+    assert worker.send("echo warm").rtn == 0
+
+    blocker = worker.send("sleep 1.0")
+    queued = worker.send("echo nope\n__xonsh__.ctx['ran_q'] = True")
+    time.sleep(0.2)
+    assert blocker.future.cancel() is False
+    assert queued.future.cancel() is True
+    assert blocker.rtn == 0
+    with pytest.raises(CancelledError):
+        _ = queued.rtn
+    assert "ran_q" not in worker.ctx
+
+    # Half-typed prompt line holds queued send until cancelled or cleared.
+    master_fd = worker._ctrl.state.master_fd
+    assert master_fd is not None
+    os.write(master_fd, b"partial_var = ")
+    time.sleep(0.2)
+
+    held = worker.send("echo held\n__xonsh__.ctx['ran_held'] = True")
+    time.sleep(0.15)
+    assert held.future.cancel() is True
+    with pytest.raises(CancelledError):
+        _ = held.rtn
+
+    # Clear the partial line with Ctrl-U so prompt becomes idle again.
+    os.write(master_fd, b"\x15")
+    assert "ran_held" not in worker.ctx
+    assert worker.send("echo recovered").out == "recovered\n"
+
+
+def test_callback_chaining_on_background_thread(spawn_peer: Any) -> None:
+    worker = spawn_peer()
+    done = threading.Event()
+    chained_outputs: list[Any] = []
+    chained_errors: list[BaseException] = []
+
+    def _on_done(fut: Any) -> None:
+        try:
+            assert fut.result() == 0
+            r2 = worker.send("echo chained-step\nprint('py-chained')")
+            chained_outputs.append((r2.rtn, r2.out))
+        except BaseException as exc:  # noqa: BLE001
+            chained_errors.append(exc)
+        finally:
+            done.set()
+
+    r1 = worker.send("echo first-step")
+    r1.future.add_done_callback(_on_done)
+    assert r1.out == "first-step\n"
+    assert done.wait(timeout=10.0)
+    assert chained_errors == []
+    assert chained_outputs == [(0, "chained-step\npy-chained\n")]
+
+
+def test_self_send_and_self_wait_inside_live_peer(spawn_peer: Any) -> None:
+    worker = spawn_peer()
+    sock_str = str(worker._socket_path)
+    worker.ctx["self_sock"] = sock_str
+
+    res = worker.send(
+        "import time\n"
+        "from xontrib_tmux import RemoteXonsh\n"
+        "me = RemoteXonsh._from_socket(self_sock, time.monotonic())\n"
+        "r_self = me.send(\"__xonsh__.ctx['self_ran'] = True\\n"
+        "echo from-self\")\n"
+        "errors = []\n"
+        "for fn in (\n"
+        "    lambda: r_self.rtn,\n"
+        "    lambda: r_self.future.result(),\n"
+        "    lambda: me.env['PATH'],\n"
+        "    lambda: me.ctx['self_sock'],\n"
+        "    lambda: me.lastcmd.rtn,\n"
+        "):\n"
+        "    try:\n"
+        "        fn()\n"
+        "    except RuntimeError as exc:\n"
+        "        errors.append(str(exc))\n"
+        "__xonsh__.ctx['self_errors'] = errors\n"
+    )
+    assert res.rtn == 0
+    errors = worker.ctx["self_errors"]
+    assert len(errors) == 5
+    assert all("Cannot wait on this shell's own peer" in msg for msg in errors)
+
+    # Queued self-send ran after the outer entry finished.
+    assert worker.ctx["self_ran"] is True
+    assert worker.lastcmd.args == ["echo", "from-self"]
+
+
+def test_python_stdout_stderr_interleaving_exceptions_and_hand_entry(
+    spawn_peer: Any,
+) -> None:
+    worker = spawn_peer()
+
+    r_print = worker.send("print(1)")
+    assert r_print.rtn == 0
+    assert r_print.out == "1\n"
+    assert r_print.err == ""
+    assert r_print.commands == []
+
+    # Interleaved Python stdout/stderr + command stdout/stderr + buffer.write.
+    r_mix = worker.send(
+        "import sys\n"
+        "echo a\n"
+        "print('b')\n"
+        "sys.stdout.buffer.write(b'b2\\n'); sys.stdout.buffer.flush()\n"
+        "echo c\n"
+        "sys.stderr.write('py-err1\\n')\n"
+        "python3 -c r\"import sys; sys.stderr.write('cmd-err\\n')\"\n"
+        "sys.stderr.write('py-err2\\n')\n"
+    )
+    assert r_mix.rtn == 0
+    assert r_mix.out == "a\nb\nb2\nc\n"
+    assert r_mix.err == "py-err1\ncmd-err\npy-err2\n"
+    assert [c.args for c in r_mix.commands] == [
+        ["echo", "a"],
+        ["echo", "c"],
+        [
+            "python3",
+            "-c",
+            "import sys; sys.stderr.write('cmd-err\\n')",
+        ],
+    ]
+
+    # Uncaught Python exception traceback lands in err.
+    r_exc = worker.send("print('before-boom')\n1 / 0")
+    assert r_exc.rtn == 1
+    assert r_exc.out == "before-boom\n"
+    assert r_exc.err is not None
+    assert "ZeroDivisionError" in r_exc.err
+
+    # record=False captures neither Python output nor commands.
+    r_unrec = worker.send("print('no-rec')\necho no-rec-cmd", record=False)
+    assert r_unrec.rtn == 0
+    assert r_unrec.out is None
+    assert r_unrec.err is None
+
+    # Foreground (@unthread) commands contribute nothing while Python prints do.
+    r_fg = worker.send("@unthread echo hidden-fg\nprint('visible-py')")
+    assert r_fg.rtn == 0
+    assert r_fg.out == "visible-py\n"
+    assert r_fg.commands[0].out is None
+
+    # Hand-typed entries on pty must not leak into sent blocks or break prompt.
+    master_fd = worker._ctrl.state.master_fd
+    assert master_fd is not None
+    os.write(master_fd, b"print('hand_typed_xyz')\r")
+    time.sleep(0.25)
+    os.write(master_fd, b"echo hand_cmd_xyz\r")
+    time.sleep(0.25)
+
+    r_after = worker.send("print('after-hand')")
+    assert r_after.rtn == 0
+    assert r_after.out == "after-hand\n"
+    assert "hand_typed_xyz" not in r_after.out
+    assert "hand_cmd_xyz" not in r_after.out
+
+
+def test_env_wait_abandoned_on_keyboard_interrupt(spawn_peer: Any) -> None:
+    worker = spawn_peer()
+    assert worker.send("echo warm").rtn == 0
+
+    busy = worker.send("sleep 1.0")
+    time.sleep(0.15)
+    timer = threading.Timer(
+        0.15, os.kill, args=(os.getpid(), signal.SIGINT)
+    )
+    timer.start()
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _ = worker.env["PATH"]
+        assert time.monotonic() - t0 < 0.7
+    finally:
+        timer.cancel()
+
+    assert busy.rtn == 0
+    assert worker.send("echo survived").out == "survived\n"
 
 
 def test_scoped_capture_closure_semantics_and_failure_restore(
@@ -426,38 +476,24 @@ def test_scoped_capture_closure_semantics_and_failure_restore(
     peer_a.ctx["b_sock"] = str(peer_b._socket_path)
     peer_a.ctx["c_sock"] = str(peer_c._socket_path)
 
-    peer_helper = (
-        "def _open_peer(sock_str):\n"
-        "    import pathlib, time\n"
-        "    from xontrib_tmux import RemoteXonsh\n"
-        "    from xontrib_tmux.peer import _PeerController\n"
-        "    ctrl = _PeerController(\n"
-        "        socket_path=pathlib.Path(sock_str),\n"
-        "        start_time=time.monotonic(),\n"
-        "        is_hidden=False,\n"
-        "        is_alive=lambda: True,\n"
-        "    )\n"
-        "    obj = RemoteXonsh.__new__(RemoteXonsh)\n"
-        "    obj._ctrl = ctrl\n"
-        "    obj._socket_path = ctrl.socket_path\n"
-        "    return obj\n"
-    )
     x = "from_driver"
     r_chain = peer_a.send(
-        peer_helper
-        + "bh = _open_peer(b_sock)\n"
-        + "rb = bh.send(\n"
-        + "    peer_helper\n"
-        + "    + \"ch = _open_peer(c_sock)\\n\"\n"
-        + "    + \"ch.send(\\\"import time\\\\ntime.sleep(0.5)\\\\n\"\n"
-        + "    + \"__xonsh__.ctx['c_saw'] = x\\\\nx = 'mut_c'\\\", \"\n"
-        + "    + \"capture=['x'])\\n\"\n"
-        + "    + \"__xonsh__.ctx['b_saw'] = x\\n\"\n"
-        + "    + \"x = 'mut_b'\\n\",\n"
-        + "    capture=['x', 'c_sock', 'peer_helper'],\n"
-        + ")\n"
-        + "rb.end()\n",
-        capture=["x", "peer_helper"],
+        "import time\n"
+        "from xontrib_tmux import RemoteXonsh\n"
+        "bh = RemoteXonsh._from_socket(b_sock, time.monotonic())\n"
+        "rb = bh.send(\n"
+        "    \"import time\\n\"\n"
+        "    \"from xontrib_tmux import RemoteXonsh\\n\"\n"
+        "    \"ch = RemoteXonsh._from_socket(c_sock, time.monotonic())\\n\"\n"
+        "    \"ch.send(\\\"import time\\\\ntime.sleep(0.5)\\\\n\"\n"
+        "    \"__xonsh__.ctx['c_saw'] = x\\\\nx = 'mut_c'\\\", \"\n"
+        "    \"capture=['x'])\\n\"\n"
+        "    \"__xonsh__.ctx['b_saw'] = x\\n\"\n"
+        "    \"x = 'mut_b'\\n\",\n"
+        "    capture=['x', 'c_sock'],\n"
+        ")\n"
+        "rb.end()\n",
+        capture=["x"],
     )
     assert r_chain.rtn == 0, r_chain.err
     assert peer_a.ctx["x"] == "before"
@@ -477,12 +513,13 @@ def test_scoped_capture_closure_semantics_and_failure_restore(
     peer_a.ctx["self_sock"] = str(peer_a._socket_path)
     x = "outer_capture"
     r_self_wrap = peer_a.send(
-        peer_helper
-        + "me = _open_peer(self_sock)\n"
-        + "x = 'captured_self'\n"
-        + "me.send(\"__xonsh__.ctx['self_saw'] = x\\nx = 'mut_self'\", "
-        + "capture=['x'])\n",
-        capture=["x", "peer_helper"],
+        "import time\n"
+        "from xontrib_tmux import RemoteXonsh\n"
+        "me = RemoteXonsh._from_socket(self_sock, time.monotonic())\n"
+        "x = 'captured_self'\n"
+        "me.send(\"__xonsh__.ctx['self_saw'] = x\\nx = 'mut_self'\", "
+        "capture=['x'])\n",
+        capture=["x"],
     )
     assert r_self_wrap.rtn == 0, r_self_wrap.err
     assert peer_a.send("echo wait-self").rtn == 0

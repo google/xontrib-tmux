@@ -562,12 +562,17 @@ def test_start_peer_server_run_errors_and_kill(
             env=env, shell=SimpleNamespace(shell=sh)
         )
 
+        kill_ev = threading.Event()
+        monkeypatch.setattr(
+            peer_server, "_kill_current_peer", lambda: kill_ev.set()
+        )
+
         peer_server.start_peer_server(fake_xsh, sock_path, is_hidden=True)
         srv = peer_server._active_server
         assert srv is not None
         try:
-            assert peer_server.is_hidden_peer() is True
             assert peer_server.current_peer_socket_path() == sock_path
+            assert peer_server.is_hidden_peer() is True
 
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as cli:
                 cli.settimeout(3.0)
@@ -650,6 +655,12 @@ def test_start_peer_server_run_errors_and_kill(
                     assert u1 is not None
                     assert u1["ok"] is False
                     assert u1["error_type"] == "RuntimeError"
+
+                    # 7. Kill request replies and triggers termination.
+                    protocol.send_json(cli, {"id": "k1", "op": "kill"})
+                    k1 = protocol.recv_json(f)
+                    assert k1 == {"version": 1, "id": "k1", "ok": True}
+                    assert kill_ev.wait(timeout=2.0)
         finally:
             srv.stop()
 
@@ -1046,498 +1057,6 @@ def test_postcommand_reports_peer_exited_on_xsh_exit(
             srv.stop()
 
 
-def test_peer_std_tee_capture_passthrough_and_close(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """_PeerStdTee captures text/bytes, passes through, and unhooks cleanly."""
-
-    class _FakeOrig(io.TextIOWrapper):
-        pass
-
-    orig_out_raw = io.BytesIO()
-    orig_out = _FakeOrig(
-        orig_out_raw,
-        encoding="utf-8",
-        errors="replace",
-        write_through=True,
-    )
-    orig_err_raw = io.BytesIO()
-    orig_err = _FakeOrig(
-        orig_err_raw,
-        encoding="utf-8",
-        errors="strict",
-        write_through=True,
-    )
-    monkeypatch.setattr(orig_out, "isatty", lambda: True)
-    monkeypatch.setattr(orig_out, "fileno", lambda: 11)
-    monkeypatch.setattr(sys, "stdout", orig_out)
-    monkeypatch.setattr(sys, "stderr", orig_err)
-
-    out_chunks: list[str] = []
-    err_chunks: list[str] = []
-    tee_out = peer_server._PeerStdTee("stdout", out_chunks)
-    tee_err = peer_server._PeerStdTee("stderr", err_chunks)
-    sys.stdout = tee_out
-    sys.stderr = tee_err
-
-    assert tee_out.encoding == "utf-8"
-    assert tee_out.errors == "replace"
-    assert tee_out.isatty() is True
-    assert tee_out.fileno() == 11
-
-    assert tee_out.write("hello ") == 6
-    assert tee_out.buffer.write(b"world\n") == 6
-    assert tee_out.buffer.write(bytearray(b"arr")) == 3
-    assert tee_out.buffer.write(memoryview(b"-mv\n")) == 4
-    assert tee_err.write("oops\n") == 5
-    tee_out.flush()
-    tee_err.flush()
-
-    assert "".join(out_chunks) == "hello world\narr-mv\n"
-    assert orig_out_raw.getvalue() == b"hello world\narr-mv\n"
-    assert "".join(err_chunks) == "oops\n"
-    assert orig_err_raw.getvalue() == b"oops\n"
-
-    # Suppressed writes pass through to original stream without capturing.
-    peer_server._stream_local.depth = 1
-    try:
-        assert tee_out.write("subproc\n") == 8
-        assert tee_out.buffer.write(b"subbuf\n") == 7
-        assert tee_err.write("suberr\n") == 7
-    finally:
-        peer_server._stream_local.depth = 0
-
-    assert "".join(out_chunks) == "hello world\narr-mv\n"
-    assert orig_out_raw.getvalue().endswith(b"subproc\nsubbuf\n")
-    assert "".join(err_chunks) == "oops\n"
-    assert orig_err_raw.getvalue().endswith(b"suberr\n")
-
-    # Direct close() restores original streams.
-    tee_out.close()
-    tee_err.close()
-    assert sys.stdout is orig_out
-    assert sys.stderr is orig_err
-
-
-def test_peer_std_tee_close_unhooks_nested_xonsh_tee(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Closing _PeerStdTee inside a nested xonsh Tee unhooks both levels."""
-    from xonsh.shells.base_shell import Tee
-
-    orig_out = io.TextIOWrapper(
-        io.BytesIO(),
-        encoding="utf-8",
-        write_through=True,
-    )
-    orig_err = io.TextIOWrapper(
-        io.BytesIO(),
-        encoding="utf-8",
-        write_through=True,
-    )
-    monkeypatch.setattr(sys, "stdout", orig_out)
-    monkeypatch.setattr(sys, "stderr", orig_err)
-
-    out_chunks: list[str] = []
-    err_chunks: list[str] = []
-    tee_out = peer_server._PeerStdTee("stdout", out_chunks)
-    tee_err = peer_server._PeerStdTee("stderr", err_chunks)
-    sys.stdout = tee_out
-    sys.stderr = tee_err
-
-    outer = Tee()
-    assert sys.stdout is not orig_out
-    assert sys.stdout.std is tee_out
-    assert sys.stdout.buffer.stdbuf is tee_out.buffer
-
-    tee_out.close()
-    tee_err.close()
-    assert sys.stdout.std is orig_out
-    assert sys.stderr.std is orig_err
-
-    outer.close()
-    assert sys.stdout is orig_out
-    assert sys.stderr is orig_err
-
-
-def test_global_hooks_suppress_tee_during_subproc_streaming(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Global hooks suppress Python tee during subproc streaming only."""
-    from xonsh.procs.pipelines import CommandPipeline
-    from xonsh.procs.proxies import ProcProxy
-
-    class _FakeOrig(io.TextIOWrapper):
-        pass
-
-    orig_out_raw = io.BytesIO()
-    orig_err_raw = io.BytesIO()
-    orig_out = _FakeOrig(orig_out_raw, encoding="utf-8", write_through=True)
-    orig_err = _FakeOrig(orig_err_raw, encoding="utf-8", write_through=True)
-    monkeypatch.setattr(sys, "stdout", orig_out)
-    monkeypatch.setattr(sys, "stderr", orig_err)
-
-    peer_server._install_global_hooks()
-
-    out_chunks: list[str] = []
-    err_chunks: list[str] = []
-    tee_out = peer_server._PeerStdTee("stdout", out_chunks)
-    tee_err = peer_server._PeerStdTee("stderr", err_chunks)
-    sys.stdout = tee_out
-    sys.stderr = tee_err
-    try:
-        captured_streams = SimpleNamespace(
-            spec=SimpleNamespace(
-                captured_stdout=object(), captured_stderr=object()
-            )
-        )
-        uncaptured_proxy = SimpleNamespace(
-            spec=SimpleNamespace(captured_stdout=None, captured_stderr=None)
-        )
-
-        # Uncaptured ProcProxy.wait suppresses tee writes during execution.
-        monkeypatch.setattr(
-            peer_server,
-            "_orig_proc_proxy_wait",
-            lambda px, *a, **k: sys.stdout.write("fg\n"),
-        )
-        ProcProxy.wait(uncaptured_proxy)
-        assert "".join(out_chunks) == ""
-        assert orig_out_raw.getvalue() == b"fg\n"
-
-        # Captured ProcProxy.wait does NOT suppress writes.
-        ProcProxy.wait(captured_streams)
-        assert "".join(out_chunks) == "fg\n"
-
-        # tee_stdout and stream_stderr suppress Python tee during streaming.
-        def fake_tee_stdout(cp: Any, *a: Any, **k: Any) -> Any:
-            sys.stdout.write("echoed\n")
-            yield "chunk"
-
-        monkeypatch.setattr(peer_server, "_orig_tee_stdout", fake_tee_stdout)
-        list(CommandPipeline.tee_stdout(captured_streams))
-        assert "".join(out_chunks) == "fg\n"
-        assert orig_out_raw.getvalue().endswith(b"echoed\n")
-
-        monkeypatch.setattr(
-            peer_server,
-            "_orig_stream_stderr",
-            lambda cp, *a, **k: sys.stderr.write("err-echo\n"),
-        )
-        CommandPipeline.stream_stderr(captured_streams)
-        assert "".join(err_chunks) == ""
-        assert orig_err_raw.getvalue() == b"err-echo\n"
-    finally:
-        tee_out.close()
-        tee_err.close()
-
-
-def test_peer_server_run_interleaves_subproc_and_python_output(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """run records interleaved subproc + Python stdout/stderr."""
-    orig_out_raw = io.BytesIO()
-    orig_err_raw = io.BytesIO()
-    orig_out = io.TextIOWrapper(
-        orig_out_raw, encoding="utf-8", write_through=True
-    )
-    orig_err = io.TextIOWrapper(
-        orig_err_raw, encoding="utf-8", write_through=True
-    )
-    monkeypatch.setattr(sys, "stdout", orig_out)
-    monkeypatch.setattr(sys, "stderr", orig_err)
-
-    fake_events = _make_fake_events()
-    monkeypatch.setattr(builtins, "events", fake_events, raising=False)
-    monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
-
-    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_iv_") as tmpdir:
-        sock_path = os.path.join(tmpdir, "peer.sock")
-        default_buf = SimpleNamespace(text="", complete_state=None)
-
-        class _FakeLoop:
-            def call_soon_threadsafe(self, fn: Any) -> None:
-                threading.Thread(target=fn, daemon=True).start()
-
-        app = SimpleNamespace(
-            is_running=True,
-            current_buffer=default_buf,
-            layout=SimpleNamespace(is_searching=False),
-            loop=_FakeLoop(),
-        )
-
-        def _make_cp(args: list[str], out: str, err: str) -> SimpleNamespace:
-            return SimpleNamespace(
-                captured="hiddenobject",
-                args=args,
-                returncode=0,
-                spec=SimpleNamespace(
-                    threadable=True,
-                    captured_stdout=object(),
-                    captured_stderr=object(),
-                ),
-                lines=[out] if out else [],
-                errors=err or None,
-            )
-
-        def validate_and_handle() -> None:
-            text = default_buf.text
-            default_buf.text = ""
-            fake_events.on_precommand.fire(cmd=text)
-            srv = peer_server._active_server
-            assert srv is not None
-            if "INTERLEAVE" in text:
-                srv._record_pipeline(_make_cp(["echo", "a"], "a\n", ""))
-                sys.stdout.write("b\n")
-                sys.stderr.write("e1\n")
-                srv._record_pipeline(_make_cp(["echo", "c"], "c\n", "e2\n"))
-            elif "NOREC" in text:
-                sys.stdout.write("hidden-out\n")
-                sys.stderr.write("hidden-err\n")
-            else:
-                sys.stdout.write("hand-out\n")
-            fake_events.on_postcommand.fire(cmd=text, rtn=0)
-
-        default_buf.validate_and_handle = validate_and_handle
-        sh = SimpleNamespace(
-            prompter=SimpleNamespace(default_buffer=default_buf, app=app),
-            need_more_lines=False,
-        )
-        fake_xsh = SimpleNamespace(
-            env={"XONSH_CAPTURE_ALWAYS": False},
-            ctx={},
-            shell=SimpleNamespace(shell=sh),
-        )
-
-        peer_server.start_peer_server(fake_xsh, sock_path)
-        srv = peer_server._active_server
-        assert srv is not None
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as cli:
-                cli.connect(sock_path)
-                cli.settimeout(5.0)
-                with cli.makefile("r", encoding="utf-8") as f:
-                    # Hand-typed command (no active entry): no tee installed.
-                    default_buf.text = "hand_typed()"
-                    default_buf.validate_and_handle()
-                    assert sys.stdout is orig_out
-                    assert sys.stderr is orig_err
-
-                    # record=True interleaves subproc + Python stdout/stderr.
-                    protocol.send_json(
-                        cli,
-                        {
-                            "id": "r1",
-                            "op": "run",
-                            "block": "INTERLEAVE",
-                            "record": True,
-                        },
-                    )
-                    rep1 = protocol.recv_json(f)
-                    assert rep1 is not None
-                    assert rep1["ok"] is True
-                    assert rep1["out"] == "a\nb\nc\n"
-                    assert rep1["err"] == "e1\ne2\n"
-                    assert [c["args"] for c in rep1["commands"]] == [
-                        ["echo", "a"],
-                        ["echo", "c"],
-                    ]
-                    assert rep1["commands"][0]["out"] == "a\n"
-                    assert rep1["commands"][1]["err"] == "e2\n"
-                    assert sys.stdout is orig_out
-                    assert sys.stderr is orig_err
-
-                    # record=False omits Python tees and returns None.
-                    protocol.send_json(
-                        cli,
-                        {
-                            "id": "r2",
-                            "op": "run",
-                            "block": "NOREC",
-                            "record": False,
-                        },
-                    )
-                    rep2 = protocol.recv_json(f)
-                    assert rep2 is not None
-                    assert rep2["ok"] is True
-                    assert rep2["out"] is None
-                    assert rep2["err"] is None
-                    assert rep2["commands"] == []
-                    assert sys.stdout is orig_out
-                    assert sys.stderr is orig_err
-        finally:
-            srv.stop()
-
-
-def test_sequential_connections_preserve_arrival_order(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Separate-socket ops preserve send order without accept overtake."""
-    fake_events = _make_fake_events()
-    monkeypatch.setattr(builtins, "events", fake_events, raising=False)
-    monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
-
-    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_ord_") as td:
-        sock_path = os.path.join(td, "p.sock")
-        default_buf = SimpleNamespace(text="", complete_state=None)
-
-        class _FakeLoop:
-            def call_soon_threadsafe(self, fn: Any) -> None:
-                threading.Thread(target=fn, daemon=True).start()
-
-        app = SimpleNamespace(
-            is_running=True,
-            current_buffer=default_buf,
-            layout=SimpleNamespace(is_searching=False),
-            loop=_FakeLoop(),
-        )
-        sh = SimpleNamespace(
-            prompter=SimpleNamespace(default_buffer=default_buf, app=app),
-            need_more_lines=False,
-        )
-        fake_xsh = SimpleNamespace(
-            env={}, ctx={}, shell=SimpleNamespace(shell=sh)
-        )
-
-        def validate_and_handle() -> None:
-            default_buf.text = ""
-            fake_events.on_precommand.fire(cmd="set")
-            fake_xsh.ctx["after_run"] = fake_xsh.ctx.get("pending_val")
-            fake_events.on_postcommand.fire(cmd="set", rtn=0)
-
-        default_buf.validate_and_handle = validate_and_handle
-        peer_server.start_peer_server(fake_xsh, sock_path)
-        srv = peer_server._active_server
-        assert srv is not None
-        try:
-            for i in range(100):
-                with (
-                    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c1,
-                    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c2,
-                ):
-                    c1.settimeout(3.0)
-                    c2.settimeout(3.0)
-                    c1.connect(sock_path)
-                    protocol.send_json(
-                        c1,
-                        {
-                            "id": f"s-{i}",
-                            "op": "ctx_set",
-                            "key": "seq",
-                            "value": protocol.encode_value(i),
-                        },
-                    )
-                    c2.connect(sock_path)
-                    protocol.send_json(
-                        c2,
-                        {"id": f"g-{i}", "op": "ctx_get", "key": "seq"},
-                    )
-                    with (
-                        c1.makefile("r", encoding="utf-8") as f1,
-                        c2.makefile("r", encoding="utf-8") as f2,
-                    ):
-                        r1 = protocol.recv_json(f1)
-                        r2 = protocol.recv_json(f2)
-                        assert r1 is not None and r1["ok"] is True
-                        assert r2 is not None and r2["ok"] is True
-                        assert protocol.decode_value(r2["value"]) == i
-
-            for i in range(25):
-                fake_xsh.ctx["pending_val"] = i
-                with (
-                    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c1,
-                    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c2,
-                ):
-                    c1.settimeout(3.0)
-                    c2.settimeout(3.0)
-                    c1.connect(sock_path)
-                    protocol.send_json(
-                        c1,
-                        {"id": f"r-{i}", "op": "run", "block": "pass"},
-                    )
-                    c2.connect(sock_path)
-                    protocol.send_json(
-                        c2,
-                        {
-                            "id": f"rg-{i}",
-                            "op": "ctx_get",
-                            "key": "after_run",
-                        },
-                    )
-                    with (
-                        c1.makefile("r", encoding="utf-8") as f1,
-                        c2.makefile("r", encoding="utf-8") as f2,
-                    ):
-                        r1 = protocol.recv_json(f1)
-                        r2 = protocol.recv_json(f2)
-                        assert r1 is not None and r1["ok"] is True
-                        assert r2 is not None and r2["ok"] is True
-                        assert protocol.decode_value(r2["value"]) == i
-        finally:
-            srv.stop()
-
-
-def test_partial_slow_connection_does_not_block_fast_connection(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """An incomplete slow first line must not stall other connecting clients."""
-    fake_events = _make_fake_events()
-    monkeypatch.setattr(builtins, "events", fake_events, raising=False)
-    monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
-
-    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_slow_") as td:
-        sock_path = os.path.join(td, "p.sock")
-        fake_buf = SimpleNamespace(text="", complete_state=None)
-        fake_app = SimpleNamespace(
-            is_running=True,
-            current_buffer=fake_buf,
-            layout=SimpleNamespace(is_searching=False),
-            loop=SimpleNamespace(),
-        )
-        fake_sh = SimpleNamespace(
-            prompter=SimpleNamespace(default_buffer=fake_buf, app=fake_app),
-            need_more_lines=False,
-        )
-        fake_xsh = SimpleNamespace(
-            env={},
-            ctx={},
-            shell=SimpleNamespace(shell=fake_sh),
-        )
-        peer_server.start_peer_server(fake_xsh, sock_path)
-        srv = peer_server._active_server
-        assert srv is not None
-        try:
-            with (
-                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c_slow,
-                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c_fast,
-            ):
-                c_slow.settimeout(2.0)
-                c_fast.settimeout(2.0)
-                c_slow.connect(sock_path)
-                c_slow.sendall(b'{"version":1,"id":"slow"')
-
-                c_fast.connect(sock_path)
-                protocol.send_json(
-                    c_fast, {"id": "fast", "op": "run", "block": "if True:\n"}
-                )
-                with c_fast.makefile("r", encoding="utf-8") as f_fast:
-                    rf = protocol.recv_json(f_fast)
-                    assert rf is not None
-                    assert rf["id"] == "fast"
-                    assert rf["ok"] is False
-                    assert rf["error_type"] == "SyntaxError"
-
-                c_slow.sendall(b',"op":"run","block":"if True:\\n"}\n')
-                with c_slow.makefile("r", encoding="utf-8") as f_slow:
-                    rs = protocol.recv_json(f_slow)
-                    assert rs is not None
-                    assert rs["id"] == "slow"
-                    assert rs["ok"] is False
-                    assert rs["error_type"] == "SyntaxError"
-        finally:
-            srv.stop()
-
-
 def test_cancel_queued_pending_prearrival_and_running(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1568,7 +1087,6 @@ def test_cancel_queued_pending_prearrival_and_running(
             executed.append(text)
             default_buf.text = ""
             if text == "slow":
-
                 def _finish_slow() -> None:
                     started_slow.set()
                     release_slow.wait(timeout=3.0)
@@ -1713,6 +1231,90 @@ def test_cancel_queued_pending_prearrival_and_running(
             assert executed == ["slow"]
         finally:
             release_slow.set()
+            srv.stop()
+
+
+def test_captured_vars_and_corrupt_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_events = _make_fake_events()
+    monkeypatch.setattr(builtins, "events", fake_events, raising=False)
+    monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_cap_") as td:
+        sock_path = os.path.join(td, "p.sock")
+        default_buf = SimpleNamespace(text="", complete_state=None)
+        executed: list[tuple[str, dict[str, Any]]] = []
+
+        class _FakeLoop:
+            def call_soon_threadsafe(self, fn: Any) -> None:
+                threading.Thread(target=fn, daemon=True).start()
+
+        app = SimpleNamespace(
+            is_running=True,
+            current_buffer=default_buf,
+            layout=SimpleNamespace(is_searching=False),
+            loop=_FakeLoop(),
+        )
+        sh = SimpleNamespace(
+            prompter=SimpleNamespace(default_buffer=default_buf, app=app),
+            need_more_lines=False,
+        )
+        fake_xsh = SimpleNamespace(
+            env={}, ctx={}, shell=SimpleNamespace(shell=sh)
+        )
+
+        def validate_and_handle() -> None:
+            executed.append((default_buf.text, dict(fake_xsh.ctx)))
+            default_buf.text = ""
+            fake_events.on_precommand.fire(cmd="x")
+            fake_events.on_postcommand.fire(cmd="x", rtn=0)
+
+        default_buf.validate_and_handle = validate_and_handle
+        peer_server.start_peer_server(fake_xsh, sock_path)
+        srv = peer_server._active_server
+        assert srv is not None
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as cli:
+                cli.settimeout(3.0)
+                cli.connect(sock_path)
+                with cli.makefile("r", encoding="utf-8") as f:
+                    payload = {"item": {"k": [1, 2, 3]}}
+                    protocol.send_json(
+                        cli,
+                        {
+                            "id": "cap1",
+                            "op": "run",
+                            "block": "print(item)",
+                            "captured": {
+                                "item": protocol.encode_value(payload["item"])
+                            },
+                        },
+                    )
+                    r1 = protocol.recv_json(f)
+                    assert r1 is not None and r1["ok"] is True
+                    assert executed == [
+                        (
+                            "# captured: item={'k': [1, 2, 3]}\nprint(item)",
+                            {"item": {"k": [1, 2, 3]}},
+                        )
+                    ]
+                    assert "item" not in fake_xsh.ctx
+
+                    protocol.send_json(
+                        cli,
+                        {
+                            "id": "cap2",
+                            "op": "run",
+                            "block": "should_not_run",
+                            "captured": {"bad": "!!!not-base64!!!"},
+                        },
+                    )
+                    r2 = protocol.recv_json(f)
+                    assert r2 is not None
+                    assert r2["ok"] is False
+                    assert len(executed) == 1
+        finally:
             srv.stop()
 
 
@@ -1919,17 +1521,231 @@ def test_env_ctx_and_lastcmd_ops(monkeypatch: pytest.MonkeyPatch) -> None:
             srv.stop()
 
 
-def test_captured_vars_and_corrupt_payload(
+def test_peer_std_tee_capture_passthrough_and_close(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """_PeerStdTee captures text/bytes, passes through, and unhooks cleanly."""
+
+    class _FakeOrig(io.TextIOWrapper):
+        pass
+
+    orig_out_raw = io.BytesIO()
+    orig_out = _FakeOrig(
+        orig_out_raw,
+        encoding="utf-8",
+        errors="replace",
+        write_through=True,
+    )
+    orig_err_raw = io.BytesIO()
+    orig_err = _FakeOrig(
+        orig_err_raw,
+        encoding="utf-8",
+        errors="strict",
+        write_through=True,
+    )
+    monkeypatch.setattr(orig_out, "isatty", lambda: True)
+    monkeypatch.setattr(orig_out, "fileno", lambda: 11)
+    monkeypatch.setattr(sys, "stdout", orig_out)
+    monkeypatch.setattr(sys, "stderr", orig_err)
+
+    out_chunks: list[str] = []
+    err_chunks: list[str] = []
+    tee_out = peer_server._PeerStdTee("stdout", out_chunks)
+    tee_err = peer_server._PeerStdTee("stderr", err_chunks)
+    sys.stdout = tee_out
+    sys.stderr = tee_err
+
+    assert tee_out.encoding == "utf-8"
+    assert tee_out.errors == "replace"
+    assert tee_out.isatty() is True
+    assert tee_out.fileno() == 11
+
+    assert tee_out.write("hello ") == 6
+    assert tee_out.buffer.write(b"world\n") == 6
+    assert tee_out.buffer.write(bytearray(b"arr")) == 3
+    assert tee_out.buffer.write(memoryview(b"-mv\n")) == 4
+    assert tee_err.write("oops\n") == 5
+    tee_out.flush()
+    tee_err.flush()
+
+    assert "".join(out_chunks) == "hello world\narr-mv\n"
+    assert orig_out_raw.getvalue() == b"hello world\narr-mv\n"
+    assert "".join(err_chunks) == "oops\n"
+    assert orig_err_raw.getvalue() == b"oops\n"
+
+    # Suppressed writes pass through to original stream without capturing.
+    peer_server._stream_local.depth = 1
+    try:
+        assert tee_out.write("subproc\n") == 8
+        assert tee_out.buffer.write(b"subbuf\n") == 7
+        assert tee_err.write("suberr\n") == 7
+    finally:
+        peer_server._stream_local.depth = 0
+
+    assert "".join(out_chunks) == "hello world\narr-mv\n"
+    assert orig_out_raw.getvalue().endswith(b"subproc\nsubbuf\n")
+    assert "".join(err_chunks) == "oops\n"
+    assert orig_err_raw.getvalue().endswith(b"suberr\n")
+
+    # Direct close() restores original streams.
+    tee_out.close()
+    tee_err.close()
+    assert sys.stdout is orig_out
+    assert sys.stderr is orig_err
+
+
+def test_peer_std_tee_close_unhooks_nested_xonsh_tee(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Closing _PeerStdTee inside a nested xonsh Tee unhooks both levels."""
+    from xonsh.shells.base_shell import Tee
+
+    orig_out = io.TextIOWrapper(
+        io.BytesIO(),
+        encoding="utf-8",
+        write_through=True,
+    )
+    orig_err = io.TextIOWrapper(
+        io.BytesIO(),
+        encoding="utf-8",
+        write_through=True,
+    )
+    monkeypatch.setattr(sys, "stdout", orig_out)
+    monkeypatch.setattr(sys, "stderr", orig_err)
+
+    out_chunks: list[str] = []
+    err_chunks: list[str] = []
+    tee_out = peer_server._PeerStdTee("stdout", out_chunks)
+    tee_err = peer_server._PeerStdTee("stderr", err_chunks)
+    sys.stdout = tee_out
+    sys.stderr = tee_err
+
+    # Open an outer xonsh Tee on top of _PeerStdTee, then close _PeerStdTee
+    # first (simulating postcommand running while an outer Tee is active),
+    # then close the outer Tee: sys.stdout/stderr must return to orig_*.
+    outer = Tee()
+    assert sys.stdout is not orig_out
+    assert sys.stdout.std is tee_out
+    assert sys.stdout.buffer.stdbuf is tee_out.buffer
+
+    tee_out.close()
+    tee_err.close()
+    assert sys.stdout.std is orig_out
+    assert sys.stderr.std is orig_err
+
+    outer.close()
+    assert sys.stdout is orig_out
+    assert sys.stderr is orig_err
+
+
+def test_global_hooks_suppress_tee_during_subproc_streaming(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Global hooks suppress Python tee during subproc streaming only."""
+    from xonsh.procs.pipelines import CommandPipeline
+    from xonsh.procs.proxies import ProcProxy
+
+    class _FakeOrig(io.TextIOWrapper):
+        pass
+
+    orig_out_raw = io.BytesIO()
+    orig_err_raw = io.BytesIO()
+    orig_out = _FakeOrig(orig_out_raw, encoding="utf-8", write_through=True)
+    orig_err = _FakeOrig(orig_err_raw, encoding="utf-8", write_through=True)
+    monkeypatch.setattr(sys, "stdout", orig_out)
+    monkeypatch.setattr(sys, "stderr", orig_err)
+
+    # Restore real original methods if hooks were already installed, or install
+    # fresh hooks against real methods.
+    peer_server._install_global_hooks()
+
+    out_chunks: list[str] = []
+    err_chunks: list[str] = []
+    tee_out = peer_server._PeerStdTee("stdout", out_chunks)
+    tee_err = peer_server._PeerStdTee("stderr", err_chunks)
+    sys.stdout = tee_out
+    sys.stderr = tee_err
+    try:
+        def _fake_tee_stdout(self: Any, *args: Any, **kwargs: Any):
+            sys.stdout.write("from-tee-stdout\n")
+            yield b"chunk1"
+            yield b"chunk2"
+
+        def _fake_stream_stderr(self: Any, *args: Any, **kwargs: Any):
+            sys.stderr.write("from-stream-stderr\n")
+            return 0
+
+        def _fake_proxy_wait(self: Any, *args: Any, **kwargs: Any):
+            if getattr(self, "_emit", None):
+                sys.stdout.write(self._emit)
+            return 0
+
+        # Patch the underlying originals stored by _install_global_hooks.
+        monkeypatch.setattr(peer_server, "_orig_tee_stdout", _fake_tee_stdout)
+        monkeypatch.setattr(
+            peer_server, "_orig_stream_stderr", _fake_stream_stderr
+        )
+        monkeypatch.setattr(
+            peer_server, "_orig_proc_proxy_wait", _fake_proxy_wait
+        )
+
+        gen = CommandPipeline.tee_stdout(SimpleNamespace())
+        assert next(gen) == b"chunk1"
+        gen.close()  # Early close triggers finally -> depth restored.
+        assert not peer_server._is_subproc_streaming()
+
+        CommandPipeline.stream_stderr(SimpleNamespace())
+        assert not peer_server._is_subproc_streaming()
+
+        # Uncaptured ProcProxy (spec=None or both captured_* None) suppresses.
+        uncaptured_proxy = SimpleNamespace(
+            spec=SimpleNamespace(captured_stdout=None, captured_stderr=None),
+            _emit="from-uncaptured-proxy\n",
+        )
+        ProcProxy.wait(uncaptured_proxy)
+        assert not peer_server._is_subproc_streaming()
+
+        # Captured ProcProxy must NOT suppress Python writes.
+        captured_proxy = SimpleNamespace(
+            spec=SimpleNamespace(
+                captured_stdout=io.BytesIO(),
+                captured_stderr=None,
+            ),
+            _emit="from-captured-proxy\n",
+        )
+        ProcProxy.wait(captured_proxy)
+        assert not peer_server._is_subproc_streaming()
+
+        assert "".join(out_chunks) == "from-captured-proxy\n"
+        assert "".join(err_chunks) == ""
+        assert b"from-tee-stdout\n" in orig_out_raw.getvalue()
+        assert b"from-uncaptured-proxy\n" in orig_out_raw.getvalue()
+        assert b"from-stream-stderr\n" in orig_err_raw.getvalue()
+    finally:
+        tee_out.close()
+        tee_err.close()
+
+
+def test_peer_server_run_interleaves_subproc_and_python_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """run reply interleaves pipeline out/err with Python sys.stdout/stderr."""
     fake_events = _make_fake_events()
     monkeypatch.setattr(builtins, "events", fake_events, raising=False)
     monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
 
-    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_cap_") as td:
-        sock_path = os.path.join(td, "p.sock")
+    orig_out = io.TextIOWrapper(
+        io.BytesIO(), encoding="utf-8", write_through=True
+    )
+    orig_err = io.TextIOWrapper(
+        io.BytesIO(), encoding="utf-8", write_through=True
+    )
+    monkeypatch.setattr(sys, "stdout", orig_out)
+    monkeypatch.setattr(sys, "stderr", orig_err)
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_iv_") as tmpdir:
+        sock_path = os.path.join(tmpdir, "peer.sock")
         default_buf = SimpleNamespace(text="", complete_state=None)
-        executed: list[tuple[str, dict[str, Any]]] = []
 
         class _FakeLoop:
             def call_soon_threadsafe(self, fn: Any) -> None:
@@ -1941,64 +1757,106 @@ def test_captured_vars_and_corrupt_payload(
             layout=SimpleNamespace(is_searching=False),
             loop=_FakeLoop(),
         )
+
+        def _make_cp(args: list[str], out: str, err: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                captured="hiddenobject",
+                args=args,
+                returncode=0,
+                spec=SimpleNamespace(
+                    threadable=True,
+                    captured_stdout=object(),
+                    captured_stderr=object(),
+                ),
+                lines=[out] if out else [],
+                errors=err or None,
+            )
+
+        def validate_and_handle() -> None:
+            text = default_buf.text
+            default_buf.text = ""
+            fake_events.on_precommand.fire(cmd=text)
+            srv = peer_server._active_server
+            assert srv is not None
+            if "INTERLEAVE" in text:
+                srv._record_pipeline(_make_cp(["echo", "a"], "a\n", ""))
+                sys.stdout.write("b\n")
+                sys.stderr.write("e1\n")
+                srv._record_pipeline(_make_cp(["echo", "c"], "c\n", "e2\n"))
+            elif "NOREC" in text:
+                sys.stdout.write("hidden-out\n")
+                sys.stderr.write("hidden-err\n")
+            else:
+                sys.stdout.write("hand-out\n")
+            fake_events.on_postcommand.fire(cmd=text, rtn=0)
+
+        default_buf.validate_and_handle = validate_and_handle
         sh = SimpleNamespace(
             prompter=SimpleNamespace(default_buffer=default_buf, app=app),
             need_more_lines=False,
         )
         fake_xsh = SimpleNamespace(
-            env={}, ctx={}, shell=SimpleNamespace(shell=sh)
+            env={"XONSH_CAPTURE_ALWAYS": False},
+            ctx={},
+            shell=SimpleNamespace(shell=sh),
         )
 
-        def validate_and_handle() -> None:
-            executed.append((default_buf.text, dict(fake_xsh.ctx)))
-            default_buf.text = ""
-            fake_events.on_precommand.fire(cmd="x")
-            fake_events.on_postcommand.fire(cmd="x", rtn=0)
-
-        default_buf.validate_and_handle = validate_and_handle
         peer_server.start_peer_server(fake_xsh, sock_path)
         srv = peer_server._active_server
         assert srv is not None
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as cli:
-                cli.settimeout(3.0)
                 cli.connect(sock_path)
+                cli.settimeout(5.0)
                 with cli.makefile("r", encoding="utf-8") as f:
-                    payload = {"item": {"k": [1, 2, 3]}}
-                    protocol.send_json(
-                        cli,
-                        {
-                            "id": "cap1",
-                            "op": "run",
-                            "block": "print(item)",
-                            "captured": {
-                                "item": protocol.encode_value(payload["item"])
-                            },
-                        },
-                    )
-                    r1 = protocol.recv_json(f)
-                    assert r1 is not None and r1["ok"] is True
-                    assert executed == [
-                        (
-                            "# captured: item={'k': [1, 2, 3]}\nprint(item)",
-                            {"item": {"k": [1, 2, 3]}},
-                        )
-                    ]
-                    assert "item" not in fake_xsh.ctx
+                    # Hand-typed command (no active entry): no tee installed.
+                    default_buf.text = "hand_typed()"
+                    default_buf.validate_and_handle()
+                    assert sys.stdout is orig_out
+                    assert sys.stderr is orig_err
 
+                    # record=True interleaves subproc + Python stdout/stderr.
                     protocol.send_json(
                         cli,
                         {
-                            "id": "cap2",
+                            "id": "r1",
                             "op": "run",
-                            "block": "should_not_run",
-                            "captured": {"bad": "!!!not-base64!!!"},
+                            "block": "INTERLEAVE",
+                            "record": True,
                         },
                     )
-                    r2 = protocol.recv_json(f)
-                    assert r2 is not None
-                    assert r2["ok"] is False
-                    assert len(executed) == 1
+                    rep1 = protocol.recv_json(f)
+                    assert rep1 is not None
+                    assert rep1["ok"] is True
+                    assert rep1["out"] == "a\nb\nc\n"
+                    assert rep1["err"] == "e1\ne2\n"
+                    assert [c["args"] for c in rep1["commands"]] == [
+                        ["echo", "a"],
+                        ["echo", "c"],
+                    ]
+                    assert rep1["commands"][0]["out"] == "a\n"
+                    assert rep1["commands"][1]["err"] == "e2\n"
+                    assert sys.stdout is orig_out
+                    assert sys.stderr is orig_err
+
+                    # record=False omits Python tees and returns None.
+                    protocol.send_json(
+                        cli,
+                        {
+                            "id": "r2",
+                            "op": "run",
+                            "block": "NOREC",
+                            "record": False,
+                        },
+                    )
+                    rep2 = protocol.recv_json(f)
+                    assert rep2 is not None
+                    assert rep2["ok"] is True
+                    assert rep2["out"] is None
+                    assert rep2["err"] is None
+                    assert rep2["commands"] == []
+                    assert sys.stdout is orig_out
+                    assert sys.stderr is orig_err
         finally:
             srv.stop()
 
@@ -2492,3 +2350,174 @@ def test_capture_restore_emits_terminal_comment_all_exit_paths(
                     assert term_writes == []
         finally:
             srv.stop()
+
+
+def test_sequential_connections_preserve_arrival_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Separate-socket ops preserve send order without accept overtake."""
+    fake_events = _make_fake_events()
+    monkeypatch.setattr(builtins, "events", fake_events, raising=False)
+    monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_ord_") as td:
+        sock_path = os.path.join(td, "p.sock")
+        default_buf = SimpleNamespace(text="", complete_state=None)
+
+        class _FakeLoop:
+            def call_soon_threadsafe(self, fn: Any) -> None:
+                threading.Thread(target=fn, daemon=True).start()
+
+        app = SimpleNamespace(
+            is_running=True,
+            current_buffer=default_buf,
+            layout=SimpleNamespace(is_searching=False),
+            loop=_FakeLoop(),
+        )
+        sh = SimpleNamespace(
+            prompter=SimpleNamespace(default_buffer=default_buf, app=app),
+            need_more_lines=False,
+        )
+        fake_xsh = SimpleNamespace(
+            env={}, ctx={}, shell=SimpleNamespace(shell=sh)
+        )
+
+        def validate_and_handle() -> None:
+            default_buf.text = ""
+            fake_events.on_precommand.fire(cmd="set")
+            fake_xsh.ctx["after_run"] = fake_xsh.ctx.get("pending_val")
+            fake_events.on_postcommand.fire(cmd="set", rtn=0)
+
+        default_buf.validate_and_handle = validate_and_handle
+        peer_server.start_peer_server(fake_xsh, sock_path)
+        srv = peer_server._active_server
+        assert srv is not None
+        try:
+            for i in range(100):
+                with (
+                    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c1,
+                    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c2,
+                ):
+                    c1.settimeout(3.0)
+                    c2.settimeout(3.0)
+                    c1.connect(sock_path)
+                    protocol.send_json(
+                        c1,
+                        {
+                            "id": f"s-{i}",
+                            "op": "ctx_set",
+                            "key": "seq",
+                            "value": protocol.encode_value(i),
+                        },
+                    )
+                    c2.connect(sock_path)
+                    protocol.send_json(
+                        c2,
+                        {"id": f"g-{i}", "op": "ctx_get", "key": "seq"},
+                    )
+                    with (
+                        c1.makefile("r", encoding="utf-8") as f1,
+                        c2.makefile("r", encoding="utf-8") as f2,
+                    ):
+                        r1 = protocol.recv_json(f1)
+                        r2 = protocol.recv_json(f2)
+                        assert r1 is not None and r1["ok"] is True
+                        assert r2 is not None and r2["ok"] is True
+                        assert protocol.decode_value(r2["value"]) == i
+
+            for i in range(25):
+                fake_xsh.ctx["pending_val"] = i
+                with (
+                    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c1,
+                    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c2,
+                ):
+                    c1.settimeout(3.0)
+                    c2.settimeout(3.0)
+                    c1.connect(sock_path)
+                    protocol.send_json(
+                        c1,
+                        {"id": f"r-{i}", "op": "run", "block": "pass"},
+                    )
+                    c2.connect(sock_path)
+                    protocol.send_json(
+                        c2,
+                        {
+                            "id": f"rg-{i}",
+                            "op": "ctx_get",
+                            "key": "after_run",
+                        },
+                    )
+                    with (
+                        c1.makefile("r", encoding="utf-8") as f1,
+                        c2.makefile("r", encoding="utf-8") as f2,
+                    ):
+                        r1 = protocol.recv_json(f1)
+                        r2 = protocol.recv_json(f2)
+                        assert r1 is not None and r1["ok"] is True
+                        assert r2 is not None and r2["ok"] is True
+                        assert protocol.decode_value(r2["value"]) == i
+        finally:
+            srv.stop()
+
+
+def test_partial_slow_connection_does_not_block_fast_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An incomplete slow first line must not stall other connecting clients."""
+    fake_events = _make_fake_events()
+    monkeypatch.setattr(builtins, "events", fake_events, raising=False)
+    monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_slow_") as td:
+        sock_path = os.path.join(td, "p.sock")
+        fake_buf = SimpleNamespace(text="", complete_state=None)
+        fake_app = SimpleNamespace(
+            is_running=True,
+            current_buffer=fake_buf,
+            layout=SimpleNamespace(is_searching=False),
+            loop=SimpleNamespace(),
+        )
+        fake_sh = SimpleNamespace(
+            prompter=SimpleNamespace(default_buffer=fake_buf, app=fake_app),
+            need_more_lines=False,
+        )
+        fake_xsh = SimpleNamespace(
+            env={},
+            ctx={},
+            shell=SimpleNamespace(shell=fake_sh),
+        )
+        peer_server.start_peer_server(fake_xsh, sock_path)
+        srv = peer_server._active_server
+        assert srv is not None
+        try:
+            with (
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c_slow,
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c_fast,
+            ):
+                c_slow.settimeout(2.0)
+                c_fast.settimeout(2.0)
+                c_slow.connect(sock_path)
+                c_slow.sendall(b'{"version":1,"id":"slow"')
+
+                c_fast.connect(sock_path)
+                protocol.send_json(
+                    c_fast, {"id": "fast", "op": "run", "block": "if True:\n"}
+                )
+                with c_fast.makefile("r", encoding="utf-8") as f_fast:
+                    rf = protocol.recv_json(f_fast)
+                    assert rf is not None
+                    assert rf["id"] == "fast"
+                    assert rf["ok"] is False
+                    assert rf["error_type"] == "SyntaxError"
+
+                c_slow.sendall(b',"op":"run","block":"if True:\\n"}\n')
+                with c_slow.makefile("r", encoding="utf-8") as f_slow:
+                    rs = protocol.recv_json(f_slow)
+                    assert rs is not None
+                    assert rs["id"] == "slow"
+                    assert rs["ok"] is False
+                    assert rs["error_type"] == "SyntaxError"
+        finally:
+            srv.stop()
+
+

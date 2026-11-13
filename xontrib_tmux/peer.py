@@ -38,6 +38,7 @@ import weakref
 from .protocol import (
     HIDDEN_PEER_ENV,
     PEER_SOCKET_ENV,
+    PROTOCOL_VERSION,
     capture_vars,
     check_block_syntax,
     decode_value,
@@ -54,6 +55,7 @@ from .result import CommandRecord, LastCmdProxy, PeerFuture, PeerResult
 _DEFAULT_ROWS = 24
 _DEFAULT_COLS = 80
 _POLL_INTERVAL_S = 0.02
+_EPOCH_THRESHOLD = 1_000_000_000.0
 _SELF_WAIT_ERROR = "Cannot wait on this shell's own peer from the main thread"
 
 _SyntaxWorkItem = tuple[str, threading.Event, list[Any]]
@@ -355,8 +357,10 @@ def _wait_until_ready(ctrl: _PeerController) -> socket.socket:
 
     timeout = default_timeout()
     start = ctrl.start_time
+    use_epoch = start > _EPOCH_THRESHOLD
+    now_fn = time.time if use_epoch else time.monotonic
     if start <= 0:
-        deadline = time.monotonic() - 1.0
+        deadline = now_fn() - 1.0
     else:
         deadline = start + timeout
 
@@ -384,7 +388,7 @@ def _wait_until_ready(ctrl: _PeerController) -> socket.socket:
                 err_msg if err_msg is not None else "Peer exited before ready"
             )
 
-        remaining = deadline - time.monotonic()
+        remaining = deadline - now_fn()
         if remaining <= 0:
             raise RuntimeError(
                 f"Timed out waiting for peer socket {ctrl.socket_path}"
@@ -899,14 +903,41 @@ class RemoteXonsh:
         self._ctrl = ctrl
         self._socket_path = socket_path
 
+    @classmethod
+    def _from_controller(cls, ctrl: _PeerController) -> "RemoteXonsh":
+        """Constructs a ``RemoteXonsh`` around an existing controller."""
+        obj = cls.__new__(cls)
+        obj._ctrl = ctrl
+        obj._socket_path = ctrl.socket_path
+        return obj
+
+    @classmethod
+    def _from_socket(
+        cls,
+        socket_path: pathlib.Path | str,
+        start_time: float,
+        is_alive: Callable[[], bool] | None = None,
+        on_kill: Callable[[], None] | None = None,
+    ) -> "RemoteXonsh":
+        """Attaches a ``RemoteXonsh`` handle to an existing peer socket."""
+        sock_path = pathlib.Path(socket_path)
+        ctrl = _PeerController(
+            socket_path=sock_path,
+            start_time=start_time,
+            is_hidden=False,
+            is_alive=is_alive,
+            on_kill=on_kill,
+        )
+        return cls._from_controller(ctrl)
+
     @property
     def env(self) -> EnvProxy:
-        """Returns a live ``MutableMapping`` view of the peer's ``env``."""
+        """Returns a live ``MutableMapping`` proxy for the peer's ``env``."""
         return EnvProxy(self)
 
     @property
     def ctx(self) -> CtxProxy:
-        """Returns a live ``MutableMapping`` view of the peer's ``ctx``."""
+        """Returns a live ``MutableMapping`` proxy for the peer's ``ctx``."""
         return CtxProxy(self)
 
     @property
@@ -1059,6 +1090,25 @@ class RemoteXonsh:
                 pass
             try:
                 sock.close()
+            except OSError:
+                pass
+
+        if ctrl.state.on_kill is None and ctrl.socket_path.exists():
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.settimeout(0.5)
+                sock.connect(str(ctrl.socket_path))
+                try:
+                    send_json(
+                        sock,
+                        {
+                            "version": PROTOCOL_VERSION,
+                            "id": uuid.uuid4().hex,
+                            "op": "kill",
+                        },
+                    )
+                finally:
+                    sock.close()
             except OSError:
                 pass
 

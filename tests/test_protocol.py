@@ -143,12 +143,10 @@ def test_socket_dir_xdg_and_permissions(
         with pytest.raises(PermissionError):
             protocol.socket_dir()
 
-        # Reject regular file or dangling symlink (FileExistsError).
+        # Reject regular file or dangling symlink (FileExistsError from mkdir).
         file_parent = rt / "fp"
         file_parent.mkdir(mode=0o700)
-        (file_parent / "xontrib-tmux").write_text(
-            "not a dir", encoding="utf-8"
-        )
+        (file_parent / "xontrib-tmux").write_text("not a dir", encoding="utf-8")
         monkeypatch.setenv("XDG_RUNTIME_DIR", str(file_parent))
         with pytest.raises(PermissionError):
             protocol.socket_dir()
