@@ -100,6 +100,15 @@ def _resolve_session_id(session: Any) -> Any:
     return session_id
 
 
+def _is_hidden_active() -> bool:
+    """Returns True if running inside a hidden peer terminal."""
+    if os.environ.get("_XONTRIB_TMUX_IS_HIDDEN_ACTIVE"):
+        return True
+    from .peer_server import is_hidden_peer
+
+    return is_hidden_peer()
+
+
 def _attach_inside_tmux(
     session: Any,
     target: Any,
@@ -157,6 +166,11 @@ def _attach_outside_tmux(
     flags_: list[str] | None,
 ) -> Any:
     """Runs ``tmux attach`` from a bare interactive terminal."""
+    if _is_hidden_active():
+        raise libtmux.exc.LibTmuxException(
+            "Cannot attach a tmux session to a hidden peer terminal"
+        )
+
     server = getattr(session, "server", None)
     tmux_bin = getattr(server, "tmux_bin", None) or "tmux"
 
