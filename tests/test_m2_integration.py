@@ -19,6 +19,8 @@ from concurrent.futures import CancelledError
 import os
 import pathlib
 import signal
+import subprocess
+import sys
 import threading
 import time
 from typing import Any
@@ -312,3 +314,177 @@ def test_env_wait_abandoned_on_keyboard_interrupt(spawn_peer: Any) -> None:
 
     assert busy.rtn == 0
     assert worker.send("echo survived").out == "survived\n"
+
+
+def test_capture_in_string_and_with_bang_forms(
+    spawn_peer: Any, tmp_path: pathlib.Path
+) -> None:
+    worker = spawn_peer()
+    local_var = {"count": 3, "label": "items"}
+    r_str = worker.send(
+        "echo @(local_var['count'])-@(local_var['label'])",
+        capture=["local_var"],
+    )
+    assert r_str.rtn == 0
+    assert r_str.out == "3-items\n"
+    assert "local_var" not in worker.ctx
+
+    with pytest.raises(NameError, match="missing_m2_var"):
+        worker.send("echo hi", capture=["missing_m2_var"])
+    unpicklable = (i for i in range(3))
+    with pytest.raises(TypeError):
+        worker.send("echo hi", capture=["unpicklable"])
+
+    script = tmp_path / "capture_macro.xsh"
+    script.write_text(
+        "xontrib load tmux\n"
+        "worker = RemoteXonsh()\n"
+        "try:\n"
+        "    info = {'kind': 'macro', 'n': 7}\n"
+        "    with! worker.send(capture=['info']) as run:\n"
+        "        echo @(info['kind'])-@(info['n'])\n"
+        "        saved_info = info\n"
+        "    assert run.rtn == 0, run.rtn\n"
+        "    assert run.out == 'macro-7\\n', repr(run.out)\n"
+        "    assert 'info' not in worker.ctx\n"
+        "    assert worker.ctx['saved_info'] == info\n"
+        "    print('CAPTURE_MACRO_OK')\n"
+        "finally:\n"
+        "    worker.kill()\n",
+        encoding="utf-8",
+    )
+    env = _isolated_subprocess_env(tmp_path)
+    proc = subprocess.run(
+        [sys.executable, "-m", "xonsh", "--no-rc", str(script)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30.0,
+        check=False,
+    )
+    assert proc.returncode == 0, (
+        f"stdout={proc.stdout!r}\nstderr={proc.stderr!r}"
+    )
+    assert "CAPTURE_MACRO_OK" in proc.stdout
+
+
+def test_scoped_capture_closure_semantics_and_failure_restore(
+    spawn_peer: Any,
+) -> None:
+    """Covers closure-like scoped capture across all 7 live-peer cases."""
+    worker = spawn_peer()
+    worker.ctx["x"] = "before"
+
+    # 1-4: pre-existing restore, temp removal, rebinding discarded, dynamic fn.
+    x = 42
+    temp_var = "only-in-block"
+    r_ok = worker.send(
+        "def read_x():\n"
+        "    return x\n"
+        "in_val = (x, temp_var, read_x())\n"
+        "x = 999\n"
+        "after_rebind = read_x()\n"
+        "saved = temp_var\n"
+        "print(in_val, after_rebind)\n",
+        capture=["x", "temp_var"],
+    )
+    assert r_ok.rtn == 0, r_ok.err
+    assert r_ok.out == "(42, 'only-in-block', 42) 999\n"
+    assert worker.ctx["x"] == "before"
+    assert "temp_var" not in worker.ctx
+    assert worker.ctx["saved"] == "only-in-block"
+    assert worker.send("print(read_x())").out == "before\n"
+
+    # 5a: restore after failing command (rtn != 0).
+    x = "fail-cmd"
+    r_fail = worker.send("ls /nonexistent_xt_capture_xyz", capture=["x"])
+    assert r_fail.rtn != 0
+    assert worker.ctx["x"] == "before"
+
+    # 5b: restore after uncaught exception (1 / 0).
+    x = "exc-cmd"
+    r_exc = worker.send("1 / 0", capture=["x"])
+    assert r_exc.rtn == 1
+    assert worker.ctx["x"] == "before"
+
+    # 5c: restore after interrupt (\x03 on pty master during sleep).
+    x = "int-cmd"
+    r_int = worker.send("sleep 5", capture=["x"])
+    time.sleep(0.25)
+    master_fd = worker._ctrl.state.master_fd
+    assert master_fd is not None
+    os.write(master_fd, b"\x03")
+    assert r_int.rtn != 0
+    assert worker.ctx["x"] == "before"
+
+    # 6: 3-shell chain A -> B -> C with C outliving B.
+    peer_a = worker
+    peer_b = spawn_peer()
+    peer_c = spawn_peer()
+    peer_b.ctx["x"] = "b_before"
+    peer_c.ctx["x"] = "c_before"
+    peer_a.ctx["b_sock"] = str(peer_b._socket_path)
+    peer_a.ctx["c_sock"] = str(peer_c._socket_path)
+
+    peer_helper = (
+        "def _open_peer(sock_str):\n"
+        "    import pathlib, time\n"
+        "    from xontrib_tmux import RemoteXonsh\n"
+        "    from xontrib_tmux.peer import _PeerController\n"
+        "    ctrl = _PeerController(\n"
+        "        socket_path=pathlib.Path(sock_str),\n"
+        "        start_time=time.monotonic(),\n"
+        "        is_hidden=False,\n"
+        "        is_alive=lambda: True,\n"
+        "    )\n"
+        "    obj = RemoteXonsh.__new__(RemoteXonsh)\n"
+        "    obj._ctrl = ctrl\n"
+        "    obj._socket_path = ctrl.socket_path\n"
+        "    return obj\n"
+    )
+    x = "from_driver"
+    r_chain = peer_a.send(
+        peer_helper
+        + "bh = _open_peer(b_sock)\n"
+        + "rb = bh.send(\n"
+        + "    peer_helper\n"
+        + "    + \"ch = _open_peer(c_sock)\\n\"\n"
+        + "    + \"ch.send(\\\"import time\\\\ntime.sleep(0.5)\\\\n\"\n"
+        + "    + \"__xonsh__.ctx['c_saw'] = x\\\\nx = 'mut_c'\\\", \"\n"
+        + "    + \"capture=['x'])\\n\"\n"
+        + "    + \"__xonsh__.ctx['b_saw'] = x\\n\"\n"
+        + "    + \"x = 'mut_b'\\n\",\n"
+        + "    capture=['x', 'c_sock', 'peer_helper'],\n"
+        + ")\n"
+        + "rb.end()\n",
+        capture=["x", "peer_helper"],
+    )
+    assert r_chain.rtn == 0, r_chain.err
+    assert peer_a.ctx["x"] == "before"
+    assert peer_b.ctx["b_saw"] == "from_driver"
+    assert peer_b.ctx["x"] == "b_before"
+    assert "c_sock" not in peer_b.ctx
+
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if "c_saw" in peer_c.ctx:
+            break
+        time.sleep(0.05)
+    assert peer_c.ctx.get("c_saw") == "from_driver"
+    assert peer_c.ctx["x"] == "c_before"
+
+    # 7: shell sending to itself with capture=["x"].
+    peer_a.ctx["self_sock"] = str(peer_a._socket_path)
+    x = "outer_capture"
+    r_self_wrap = peer_a.send(
+        peer_helper
+        + "me = _open_peer(self_sock)\n"
+        + "x = 'captured_self'\n"
+        + "me.send(\"__xonsh__.ctx['self_saw'] = x\\nx = 'mut_self'\", "
+        + "capture=['x'])\n",
+        capture=["x", "peer_helper"],
+    )
+    assert r_self_wrap.rtn == 0, r_self_wrap.err
+    assert peer_a.send("echo wait-self").rtn == 0
+    assert peer_a.ctx["self_saw"] == "captured_self"
+    assert peer_a.ctx["x"] == "before"

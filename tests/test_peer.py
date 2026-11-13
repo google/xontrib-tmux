@@ -43,6 +43,7 @@ from xontrib_tmux.peer import (
 from xontrib_tmux.protocol import (
     HIDDEN_PEER_ENV,
     PEER_SOCKET_ENV,
+    decode_captured,
     decode_value,
     encode_value,
     recv_json,
@@ -1194,5 +1195,57 @@ def test_self_send_and_self_wait_guard(
 
         # Once hold_res is already finished, reading on main thread works.
         assert hold_res.out == "hi\n"
+    finally:
+        srv.close()
+
+
+def test_capture_in_string_and_macro_forms(tmp_path: pathlib.Path) -> None:
+    sock = _short_sock(tmp_path, "capture.sock")
+    seen_reqs: list[dict[str, Any]] = []
+
+    def handler(conn: socket.socket, req: dict[str, Any]) -> None:
+        seen_reqs.append(req)
+        send_json(
+            conn,
+            {
+                "id": req["id"],
+                "ok": True,
+                "rtn": 0,
+                "commands": [],
+            },
+        )
+
+    srv = _MockPeerServer(sock, handler).start()
+    try:
+        peer = _peer_from_socket(sock, time.monotonic())
+        local_var = {"count": 3, "label": "items"}
+
+        res1 = peer.send("echo hi", capture=["local_var"])
+        assert res1.rtn == 0
+
+        macro = peer.send(capture=["local_var"])
+        assert isinstance(macro, PeerMacro)
+        macro.macro_block = "echo from-macro\n"
+        macro.macro_globals = {}
+        macro.macro_locals = {}
+        with macro as res2:
+            assert res2.rtn == 0
+
+        assert len(seen_reqs) == 2
+        assert decode_captured(seen_reqs[0]["captured"]) == {
+            "local_var": {"count": 3, "label": "items"}
+        }
+        assert decode_captured(seen_reqs[1]["captured"]) == {
+            "local_var": {"count": 3, "label": "items"}
+        }
+
+        with pytest.raises(NameError, match="no_such_var"):
+            peer.send("echo hi", capture=["no_such_var"])
+        unpicklable = (i for i in range(3))
+        with pytest.raises(TypeError):
+            peer.send("echo hi", capture=["unpicklable"])
+        with pytest.raises(TypeError):
+            peer.send("echo hi", capture="local_var")  # type: ignore[arg-type]
+        assert len(seen_reqs) == 2
     finally:
         srv.close()

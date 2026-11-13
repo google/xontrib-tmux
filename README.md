@@ -90,12 +90,19 @@ socket (`peer_server.py`), with **no dependency on `tmux`** (it works even when
   as a context manager (`with RemoteXonsh() as peer: ...`) and also terminates
   the child process on `peer.kill()`, when garbage-collected after any
   in-flight blocks finish, or at interpreter exit.
-- `peer.send(block=None, /, record=True)`:
+- `peer.send(block=None, /, capture=None, record=True)`:
   - Call with a source string (`peer.send("x = 1\necho @(x)")`) to run a block
     and return a `PeerResult`.
-  - Use as a xonsh macro (`with! peer.send() as r:` or `with! peer.send():`) to
-    capture the block body without running it in the caller, returning a
+  - Use as a xonsh macro (`with! peer.send(...) as r:` or `with! peer.send():`)
+    to capture the block body without running it in the caller, returning a
     `PeerResult` bound to `as` when provided.
+  - Pass `capture=["name", ...]` to snapshot variables by value from the caller
+    scope into the peer for the duration of the block (`NameError` / pickling
+    errors raise in the caller before submission). Prior `ctx` bindings are
+    restored (and newly introduced names unset) when the block ends, with a
+    leading `# captured: ...` header and a terminal
+    `# restored: ...; unset: ...` line emitted cleanly outside result capture
+    and history.
 - `PeerResult`:
   - `rtn`: return code of the last executed statement (or first failing command).
   - `out`, `err`, `lines`: captured stdout/stderr strings and output lines (or

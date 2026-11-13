@@ -15,9 +15,10 @@
 """Sender-side ``RemoteXonsh`` peer controller and ``PeerMacro``."""
 
 import atexit
-from collections.abc import Callable, Iterator, MutableMapping
+from collections.abc import Callable, Iterator, MutableMapping, Sequence
 from concurrent.futures import InvalidStateError
 import fcntl
+import inspect
 import os
 import pathlib
 import pty
@@ -37,6 +38,7 @@ import weakref
 from .protocol import (
     HIDDEN_PEER_ENV,
     PEER_SOCKET_ENV,
+    capture_vars,
     check_block_syntax,
     decode_value,
     default_timeout,
@@ -402,6 +404,8 @@ def _decode_error_response(resp: dict[str, Any]) -> BaseException:
         return KeyError(err_msg)
     if err_type == "TypeError":
         return TypeError(err_msg)
+    if err_type == "NameError":
+        return NameError(err_msg)
     return RuntimeError(err_msg)
 
 
@@ -584,6 +588,7 @@ def _request_worker(
     req_id: str,
     normalized_block: str,
     record: bool,
+    captured: dict[str, Any] | None,
     req_state: _RequestState,
     result: PeerResult,
 ) -> None:
@@ -622,6 +627,7 @@ def _request_worker(
                         "op": "run",
                         "block": normalized_block,
                         "record": record,
+                        "captured": captured if captured is not None else {},
                     },
                 )
         finally:
@@ -787,10 +793,12 @@ class PeerMacro:
         self,
         peer: "RemoteXonsh",
         record: bool = True,
+        captured: dict[str, Any] | None = None,
     ) -> None:
         """Initializes a ``with!`` macro wrapper for ``peer.send()``."""
         self._peer = peer
         self._record = record
+        self._captured = captured
 
     def __enter__(self) -> PeerResult:
         """Validates ``macro_block`` and dispatches it to the peer."""
@@ -802,6 +810,7 @@ class PeerMacro:
         return self._peer._submit_block(
             self.macro_block,
             record=self._record,
+            captured=self._captured,
         )
 
     def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
@@ -917,12 +926,15 @@ class RemoteXonsh:
         self,
         block: str | None = None,
         /,
+        capture: Sequence[str] | None = None,
         record: bool = True,
     ) -> PeerResult | PeerMacro:
         """Runs a xonsh block on the peer or returns a ``with!`` macro.
 
         Args:
             block: Command block string, or ``None`` for ``with!`` macro mode.
+            capture: Optional sequence of caller variable names to copy into
+                the peer's ``ctx`` before executing the block.
             record: Whether to record stdout/stderr of recorded commands.
 
         Returns:
@@ -930,14 +942,36 @@ class RemoteXonsh:
         """
         if self._ctrl.state.killed:
             raise RuntimeError("Peer has been killed")
+        captured: dict[str, str] | None = None
+        if capture is not None:
+            frame = inspect.currentframe()
+            caller_frame = frame.f_back if frame is not None else None
+            del frame
+            try:
+                captured = capture_vars(caller_frame, capture)
+            finally:
+                caller_frame = None
+        return self._send_from_caller(block, captured=captured, record=record)
+
+    def _send_from_caller(
+        self,
+        block: str | None = None,
+        /,
+        captured: dict[str, Any] | None = None,
+        record: bool = True,
+    ) -> PeerResult | PeerMacro:
+        """Dispatches ``send()`` with pre-captured variables."""
+        if self._ctrl.state.killed:
+            raise RuntimeError("Peer has been killed")
         if block is None:
-            return PeerMacro(self, record=record)
-        return self._submit_block(block, record=record)
+            return PeerMacro(self, record=record, captured=captured)
+        return self._submit_block(block, record=record, captured=captured)
 
     def _submit_block(
         self,
         block: str,
         record: bool = True,
+        captured: dict[str, Any] | None = None,
     ) -> PeerResult:
         """Validates syntax synchronously and dispatches the block."""
         if self._ctrl.state.killed:
@@ -984,7 +1018,16 @@ class RemoteXonsh:
 
         worker = threading.Thread(
             target=_request_worker,
-            args=(ctrl, ticket, req_id, normalized, record, req_state, result),
+            args=(
+                ctrl,
+                ticket,
+                req_id,
+                normalized,
+                record,
+                captured,
+                req_state,
+                result,
+            ),
             daemon=True,
         )
         try:

@@ -17,6 +17,7 @@
 import ast
 import builtins
 from concurrent.futures import ThreadPoolExecutor
+import inspect
 import os
 import pathlib
 import socket
@@ -338,6 +339,10 @@ def test_send_and_recv_json() -> None:
         s2.close()
 
 
+_CAPTURE_GLOBAL = {"role": "global"}
+_CAPTURE_SHADOWED = "global_val"
+
+
 def test_encode_decode_value_round_trip() -> None:
     payload = {"nums": [1, 2, 3], "fn": lambda x: x + 1}
     encoded = protocol.encode_value(payload)
@@ -345,3 +350,43 @@ def test_encode_decode_value_round_trip() -> None:
     decoded = protocol.decode_value(encoded)
     assert decoded["nums"] == [1, 2, 3]
     assert decoded["fn"](4) == 5
+
+
+def test_capture_vars_locals_globals_and_errors() -> None:
+    _CAPTURE_SHADOWED = "local_val"  # noqa: N806
+    local_dict = {"count": 3, "label": "items"}
+
+    def _run_capture(names: Any) -> dict[str, str]:
+        frame = inspect.currentframe()
+        assert frame is not None
+        return protocol.capture_vars(frame.f_back, names)
+
+    captured = _run_capture(
+        ["local_dict", "_CAPTURE_SHADOWED", "_CAPTURE_GLOBAL"]
+    )
+    decoded = protocol.decode_captured(captured)
+    assert decoded == {
+        "local_dict": {"count": 3, "label": "items"},
+        "_CAPTURE_SHADOWED": "local_val",
+        "_CAPTURE_GLOBAL": {"role": "global"},
+    }
+
+    assert _run_capture([]) == {}
+
+    with pytest.raises(NameError, match="missing_var_xyz"):
+        _run_capture(["local_dict", "missing_var_xyz"])
+
+    assert protocol.capture_vars(None, []) == {}
+    with pytest.raises(NameError, match="x"):
+        protocol.capture_vars(None, ["x"])
+
+    with pytest.raises(TypeError, match="not str or bytes"):
+        _run_capture("local_dict")
+    with pytest.raises(TypeError, match="not str or bytes"):
+        _run_capture(b"local_dict")
+    with pytest.raises(TypeError):
+        _run_capture([123])
+
+    unpicklable = (i for i in range(3))
+    with pytest.raises(TypeError):
+        _run_capture(["unpicklable"])

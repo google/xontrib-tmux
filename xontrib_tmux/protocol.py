@@ -16,6 +16,7 @@
 
 import base64
 import builtins
+from collections.abc import Sequence
 import itertools
 import json
 import os
@@ -25,6 +26,7 @@ import socket
 import stat
 import struct
 import threading
+import types
 from typing import Any, IO
 
 
@@ -326,3 +328,68 @@ def decode_value(b64: str) -> Any:
     import dill
 
     return dill.loads(base64.b64decode(b64.encode("ascii")))
+
+
+def capture_vars(
+    frame: types.FrameType | None,
+    names: Sequence[str],
+) -> dict[str, str]:
+    """Looks up ``names`` in ``frame`` and encodes them for JSON transport.
+
+    Resolves each name in ``frame.f_locals`` and then ``frame.f_globals``,
+    raising ``NameError`` if missing and propagating pickling errors from
+    ``dill.dumps`` immediately. Always deletes ``frame`` in ``finally``.
+
+    Args:
+        frame: Caller execution frame, or ``None`` if unavailable.
+        names: Sequence of variable names to capture.
+
+    Returns:
+        Mapping from variable name to base64-encoded ``dill`` payload.
+
+    Raises:
+        TypeError: If ``names`` is not a sequence of strings.
+        NameError: If any requested variable name is not in scope.
+    """
+    encoded: dict[str, str] = {}
+    try:
+        if isinstance(names, (str, bytes)):
+            raise TypeError(
+                "capture must be a sequence of variable names, not str or bytes"
+            )
+        if not isinstance(names, Sequence):
+            raise TypeError("capture must be a sequence of variable names")
+        if frame is None:
+            if names:
+                raise NameError(f"name {names[0]!r} is not defined")
+            return encoded
+        locs = frame.f_locals
+        globs = frame.f_globals
+        for name in names:
+            if not isinstance(name, str):
+                raise TypeError(
+                    f"capture variable name must be str, "
+                    f"got {type(name).__name__}"
+                )
+            if name in locs:
+                val = locs[name]
+            elif name in globs:
+                val = globs[name]
+            else:
+                raise NameError(f"name {name!r} is not defined")
+            encoded[name] = encode_value(val)
+        return encoded
+    finally:
+        del frame
+
+
+def decode_captured(encoded: dict[str, str]) -> dict[str, Any]:
+    """Decodes a ``{name: b64}`` mapping produced by :func:`capture_vars`.
+
+    Args:
+        encoded: Mapping from variable name to base64-encoded ``dill`` payload.
+
+    Returns:
+        Mapping from variable name to deserialized Python object.
+    """
+    return {name: decode_value(b64) for name, b64 in encoded.items()}

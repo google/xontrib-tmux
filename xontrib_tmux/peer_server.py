@@ -31,6 +31,7 @@ from . import parser_patch
 from .parser_patch import mark_peer_server_started, write_startup_error
 from .protocol import (
     check_block_syntax,
+    decode_captured,
     decode_value,
     encode_value,
     recv_json,
@@ -40,6 +41,16 @@ from .protocol import (
 
 
 _NON_PTK_ERROR = "Peer xonsh is not running the prompt_toolkit shell"
+_MISSING = object()
+_MAX_CAPTURED_REPR_LEN = 40
+_MAX_CONTAINER_REPR_ITEMS = 5
+_UNSAFE_REPR_TYPES = (
+    "PeerResult",
+    "RemoteXonsh",
+    "LastCmdProxy",
+    "EnvProxy",
+    "CtxProxy",
+)
 _QUEUED_OPS = frozenset(
     {
         "run",
@@ -406,6 +417,103 @@ def _install_global_hooks() -> None:
             )
 
 
+def _format_captured_value(val: Any) -> str:
+    """Formats one decoded captured value for ``# captured: ...`` safely."""
+    type_name = type(val).__name__
+    if type_name in _UNSAFE_REPR_TYPES:
+        return f"<{type_name}>"
+    if isinstance(val, (dict, list, tuple, set, frozenset)):
+        n = len(val)
+        unit = "item" if n == 1 else "items"
+        summary = f"<{type_name}, {n} {unit}>"
+        if n > _MAX_CONTAINER_REPR_ITEMS:
+            return summary
+        try:
+            rendered = repr(val)
+        except Exception:
+            return summary
+        if (
+            "\n" in rendered
+            or "\r" in rendered
+            or len(rendered) > _MAX_CAPTURED_REPR_LEN
+        ):
+            return summary
+        return rendered
+    if (
+        isinstance(val, (bytes, bytearray))
+        and len(val) > _MAX_CAPTURED_REPR_LEN
+    ):
+        n = len(val)
+        unit = "byte" if n == 1 else "bytes"
+        return f"<{type_name}, {n} {unit}>"
+    try:
+        rendered = repr(val)
+    except Exception:
+        return f"<{type_name}>"
+    rendered = rendered.replace("\r\n", " ").replace("\n", " ").replace(
+        "\r", " "
+    )
+    if len(rendered) > _MAX_CAPTURED_REPR_LEN:
+        return rendered[: _MAX_CAPTURED_REPR_LEN - 3] + "..."
+    return rendered
+
+
+def _format_captured_comment(decoded: dict[str, Any]) -> str:
+    """Builds the single-line ``# captured: ...`` comment header."""
+    if not decoded:
+        return ""
+    parts = [
+        f"{name}={_format_captured_value(val)}" for name, val in decoded.items()
+    ]
+    return "# captured: " + ", ".join(parts)
+
+
+def _format_restored_comment(saved: dict[str, Any]) -> str:
+    """Builds the single-line ``# restored: ...; unset: ...`` comment.
+
+    Uses ``_format_captured_value`` for prior bindings, groups newly added
+    names under ``unset:``, and omits any empty half. Purely terminal feedback:
+    not a history entry, never recorded in command output, and never raises.
+    """
+    if not saved:
+        return ""
+    restored = [
+        f"{name}={_format_captured_value(val)}"
+        for name, val in saved.items()
+        if val is not _MISSING
+    ]
+    unset = [name for name, val in saved.items() if val is _MISSING]
+    parts: list[str] = []
+    if restored:
+        parts.append("restored: " + ", ".join(restored))
+    if unset:
+        parts.append("unset: " + ", ".join(unset))
+    if not parts:
+        return ""
+    return "# " + "; ".join(parts)
+
+
+def _write_restored_comment(comment: str) -> None:
+    """Writes a restore comment line to the peer's terminal before the prompt.
+
+    Must be called after command tees close so it is terminal output only
+    (not in ``result.out``/``err``, ``commands``, or shell history) and never
+    raises or blocks.
+    """
+    if not comment:
+        return
+    try:
+        out = sys.stdout if sys.stdout is not None else sys.__stdout__
+        if out is None:
+            return
+        out.write(f"{comment}\n")
+        flush = getattr(out, "flush", None)
+        if callable(flush):
+            flush()
+    except Exception:
+        pass
+
+
 @dataclass
 class _PeerEntry:
     """State for a single submitted block currently running at the prompt."""
@@ -423,6 +531,7 @@ class _PeerEntry:
     had_capture: bool = False
     prev_capture: Any = None
     precommand_ran: bool = False
+    capture_pushed: bool = False
     done_event: threading.Event = field(default_factory=threading.Event)
 
 
@@ -470,6 +579,7 @@ class _PeerServer:
         self._precommand_fn: Callable[..., Any] | None = None
         self._postcommand_fn: Callable[..., Any] | None = None
         self._pre_prompt_fn: Callable[..., Any] | None = None
+        self._capture_stack: list[dict[str, Any]] = []
 
     def start(self) -> None:
         """Installs hooks (when accepting blocks) and starts server threads."""
@@ -511,7 +621,7 @@ class _PeerServer:
             self._active_entry = None
         if active is not None:
             try:
-                self._restore_capture(active)
+                self._restore_capture(active, emit_restored=False)
             finally:
                 active.done_event.set()
         self._wakeup_event.set()
@@ -683,7 +793,46 @@ class _PeerServer:
         self._postcommand_fn = None
         self._pre_prompt_fn = None
 
-    def _restore_capture(self, entry: _PeerEntry) -> None:
+    def _push_capture_scope(
+        self, entry: _PeerEntry, decoded: dict[str, Any]
+    ) -> None:
+        if not decoded:
+            return
+        ctx = getattr(self.xsh, "ctx", None)
+        if isinstance(ctx, dict):
+            saved = {name: ctx.get(name, _MISSING) for name in decoded}
+            self._capture_stack.append(saved)
+            entry.capture_pushed = True
+            ctx.update(decoded)
+
+    def _pop_capture_scope(
+        self, entry: _PeerEntry, *, emit_restored: bool = True
+    ) -> None:
+        """Restores captured names and optionally emits the restore line.
+
+        The emitted ``# restored: ...`` / ``# unset: ...`` line goes only to
+        the peer's terminal stdout (not a history entry, command record, or
+        result output).
+        """
+        if not entry.capture_pushed:
+            return
+        entry.capture_pushed = False
+        if not self._capture_stack:
+            return
+        saved = self._capture_stack.pop()
+        ctx = getattr(self.xsh, "ctx", None)
+        if isinstance(ctx, dict):
+            for name, prev_val in saved.items():
+                if prev_val is _MISSING:
+                    ctx.pop(name, None)
+                else:
+                    ctx[name] = prev_val
+        if emit_restored:
+            _write_restored_comment(_format_restored_comment(saved))
+
+    def _restore_capture(
+        self, entry: _PeerEntry, *, emit_restored: bool = True
+    ) -> None:
         if entry.stdout_tee is not None:
             entry.stdout_tee.close()
             entry.stdout_tee = None
@@ -697,6 +846,7 @@ class _PeerServer:
                     env["XONSH_CAPTURE_ALWAYS"] = entry.prev_capture
                 else:
                     env.pop("XONSH_CAPTURE_ALWAYS", None)
+        self._pop_capture_scope(entry, emit_restored=emit_restored)
 
     def _record_pipeline(self, cp: Any) -> None:
         with self._entry_lock:
@@ -1173,7 +1323,7 @@ class _PeerServer:
                 send_lock=send_lock,
                 done_event=done_ev,
             )
-            self._submit_when_idle(entry, normalized)
+            self._submit_when_idle(entry, normalized, req.get("captured"))
 
     def _execute_state_op(self, req: dict[str, Any]) -> dict[str, Any]:
         req_id = req.get("id")
@@ -1334,7 +1484,10 @@ class _PeerServer:
             done_ev.set()
 
     def _submit_when_idle(
-        self, entry: _PeerEntry, normalized: str
+        self,
+        entry: _PeerEntry,
+        normalized: str,
+        captured: dict[str, str] | None = None,
     ) -> None:
         text_to_submit = normalized.rstrip("\n")
         req_id = entry.req_id
@@ -1370,14 +1523,34 @@ class _PeerServer:
                                 if not _is_prompt_idle(_sh, _app):
                                     submit_state["submitted"] = False
                                     return
+                                decoded: dict[str, Any] = {}
+                                if captured:
+                                    try:
+                                        decoded = decode_captured(captured)
+                                    except Exception as exc:
+                                        self._pending_run = None
+                                        if isinstance(req_id, str):
+                                            self._committed_ids.add(req_id)
+                                        submit_state["error"] = exc
+                                        submit_state["error_type"] = type(
+                                            exc
+                                        ).__name__
+                                        return
+                                    self._push_capture_scope(entry, decoded)
                                 self._pending_run = None
                                 if isinstance(req_id, str):
                                     self._committed_ids.add(req_id)
 
+                            submit_text = text_to_submit
+                            if decoded:
+                                comment = _format_captured_comment(decoded)
+                                if comment:
+                                    submit_text = f"{comment}\n{text_to_submit}"
+
                             self._entry_done.clear()
                             with self._entry_lock:
                                 self._active_entry = entry
-                            _sh.prompter.default_buffer.text = text_to_submit
+                            _sh.prompter.default_buffer.text = submit_text
                             _sh.prompter.default_buffer.validate_and_handle()
                             submit_state["submitted"] = True
                         except Exception as exc:

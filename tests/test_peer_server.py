@@ -1917,3 +1917,578 @@ def test_env_ctx_and_lastcmd_ops(monkeypatch: pytest.MonkeyPatch) -> None:
                     assert prompt_submissions == []
         finally:
             srv.stop()
+
+
+def test_captured_vars_and_corrupt_payload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_events = _make_fake_events()
+    monkeypatch.setattr(builtins, "events", fake_events, raising=False)
+    monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_cap_") as td:
+        sock_path = os.path.join(td, "p.sock")
+        default_buf = SimpleNamespace(text="", complete_state=None)
+        executed: list[tuple[str, dict[str, Any]]] = []
+
+        class _FakeLoop:
+            def call_soon_threadsafe(self, fn: Any) -> None:
+                threading.Thread(target=fn, daemon=True).start()
+
+        app = SimpleNamespace(
+            is_running=True,
+            current_buffer=default_buf,
+            layout=SimpleNamespace(is_searching=False),
+            loop=_FakeLoop(),
+        )
+        sh = SimpleNamespace(
+            prompter=SimpleNamespace(default_buffer=default_buf, app=app),
+            need_more_lines=False,
+        )
+        fake_xsh = SimpleNamespace(
+            env={}, ctx={}, shell=SimpleNamespace(shell=sh)
+        )
+
+        def validate_and_handle() -> None:
+            executed.append((default_buf.text, dict(fake_xsh.ctx)))
+            default_buf.text = ""
+            fake_events.on_precommand.fire(cmd="x")
+            fake_events.on_postcommand.fire(cmd="x", rtn=0)
+
+        default_buf.validate_and_handle = validate_and_handle
+        peer_server.start_peer_server(fake_xsh, sock_path)
+        srv = peer_server._active_server
+        assert srv is not None
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as cli:
+                cli.settimeout(3.0)
+                cli.connect(sock_path)
+                with cli.makefile("r", encoding="utf-8") as f:
+                    payload = {"item": {"k": [1, 2, 3]}}
+                    protocol.send_json(
+                        cli,
+                        {
+                            "id": "cap1",
+                            "op": "run",
+                            "block": "print(item)",
+                            "captured": {
+                                "item": protocol.encode_value(payload["item"])
+                            },
+                        },
+                    )
+                    r1 = protocol.recv_json(f)
+                    assert r1 is not None and r1["ok"] is True
+                    assert executed == [
+                        (
+                            "# captured: item={'k': [1, 2, 3]}\nprint(item)",
+                            {"item": {"k": [1, 2, 3]}},
+                        )
+                    ]
+                    assert "item" not in fake_xsh.ctx
+
+                    protocol.send_json(
+                        cli,
+                        {
+                            "id": "cap2",
+                            "op": "run",
+                            "block": "should_not_run",
+                            "captured": {"bad": "!!!not-base64!!!"},
+                        },
+                    )
+                    r2 = protocol.recv_json(f)
+                    assert r2 is not None
+                    assert r2["ok"] is False
+                    assert len(executed) == 1
+        finally:
+            srv.stop()
+
+
+def test_format_captured_value_and_comment() -> None:
+    """Tests single-line safe formatting and truncation for # captured:."""
+    assert peer_server._format_captured_comment({}) == ""
+
+    class _BrokenRepr:
+        def __repr__(self) -> str:
+            raise RuntimeError("repr exploded")
+
+    class PeerResult:
+        def __repr__(self) -> str:
+            raise AssertionError("must not call repr on PeerResult")
+
+    assert peer_server._format_captured_value(PeerResult()) == "<PeerResult>"
+    assert (
+        peer_server._format_captured_value(_BrokenRepr()) == "<_BrokenRepr>"
+    )
+
+    big_dict = {f"k{i}": i for i in range(12)}
+    assert (
+        peer_server._format_captured_value(big_dict) == "<dict, 12 items>"
+    )
+
+    long_item_set = {"x" * 50}
+    assert (
+        peer_server._format_captured_value(long_item_set) == "<set, 1 item>"
+    )
+
+    assert peer_server._format_captured_value(b"abc") == "b'abc'"
+    assert (
+        peer_server._format_captured_value(b"a" * 50) == "<bytes, 50 bytes>"
+    )
+    assert (
+        peer_server._format_captured_value(bytearray(b"a" * 41))
+        == "<bytearray, 41 bytes>"
+    )
+
+    long_str = "a" * 50
+    formatted_str = peer_server._format_captured_value(long_str)
+    assert len(formatted_str) == 40
+    assert formatted_str.endswith("...")
+
+    multiline = "line1\nline2\r\nline3\rline4"
+    formatted_ml = peer_server._format_captured_value(multiline)
+    assert "\n" not in formatted_ml and "\r" not in formatted_ml
+
+    comment = peer_server._format_captured_comment(
+        {"x": 42, "issue": "gh-17", "cfg": big_dict}
+    )
+    assert comment == "# captured: x=42, issue='gh-17', cfg=<dict, 12 items>"
+
+
+def test_capture_stack_scoped_restore_all_exit_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Scoped capture restores ctx across postcommand, pre_prompt, exc, stop."""
+    fake_events = _make_fake_events()
+    monkeypatch.setattr(builtins, "events", fake_events, raising=False)
+    monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_stk_") as td:
+        sock_path = os.path.join(td, "p.sock")
+        default_buf = SimpleNamespace(text="", complete_state=None)
+        mode = {"kind": "normal"}
+
+        class _FakeLoop:
+            def call_soon_threadsafe(self, fn: Any) -> None:
+                threading.Thread(target=fn, daemon=True).start()
+
+        app = SimpleNamespace(
+            is_running=True,
+            current_buffer=default_buf,
+            layout=SimpleNamespace(is_searching=False),
+            loop=_FakeLoop(),
+        )
+        sh = SimpleNamespace(
+            prompter=SimpleNamespace(default_buffer=default_buf, app=app),
+            need_more_lines=False,
+        )
+        fake_xsh = SimpleNamespace(
+            env={},
+            ctx={"existing": "orig"},
+            shell=SimpleNamespace(shell=sh),
+        )
+
+        def validate_and_handle() -> None:
+            default_buf.text = ""
+            kind = mode["kind"]
+            if kind == "normal":
+                assert fake_xsh.ctx["existing"] == "override"
+                assert fake_xsh.ctx["temp"] == 123
+                fake_xsh.ctx["existing"] = "rebound"
+                fake_xsh.ctx["persisted"] = "kept"
+                fake_events.on_precommand.fire(cmd="x")
+                fake_events.on_postcommand.fire(cmd="x", rtn=0)
+            elif kind == "pre_prompt":
+                assert fake_xsh.ctx["existing"] == "override2"
+                fake_events.on_pre_prompt.fire()
+            elif kind == "raise":
+                raise RuntimeError("boom in validate")
+            elif kind == "stop":
+                assert fake_xsh.ctx["existing"] == "override_stop"
+
+        default_buf.validate_and_handle = validate_and_handle
+        peer_server.start_peer_server(fake_xsh, sock_path)
+        srv = peer_server._active_server
+        assert srv is not None
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as cli:
+                cli.settimeout(3.0)
+                cli.connect(sock_path)
+                with cli.makefile("r", encoding="utf-8") as f:
+                    # 1. Normal finish: restore existing, pop temp, keep new.
+                    protocol.send_json(
+                        cli,
+                        {
+                            "id": "s1",
+                            "op": "run",
+                            "block": "pass",
+                            "captured": {
+                                "existing": protocol.encode_value("override"),
+                                "temp": protocol.encode_value(123),
+                            },
+                        },
+                    )
+                    r1 = protocol.recv_json(f)
+                    assert r1 is not None and r1["ok"] is True
+                    assert fake_xsh.ctx["existing"] == "orig"
+                    assert "temp" not in fake_xsh.ctx
+                    assert fake_xsh.ctx["persisted"] == "kept"
+
+                    # 2. _on_pre_prompt restores without postcommand.
+                    mode["kind"] = "pre_prompt"
+                    protocol.send_json(
+                        cli,
+                        {
+                            "id": "s2",
+                            "op": "run",
+                            "block": "pass",
+                            "captured": {
+                                "existing": protocol.encode_value("override2"),
+                                "temp2": protocol.encode_value("v"),
+                            },
+                        },
+                    )
+                    r2 = protocol.recv_json(f)
+                    assert r2 is not None and r2["ok"] is False
+                    assert fake_xsh.ctx["existing"] == "orig"
+                    assert "temp2" not in fake_xsh.ctx
+
+                    # 3. Exception inside validate_and_handle restores.
+                    mode["kind"] = "raise"
+                    protocol.send_json(
+                        cli,
+                        {
+                            "id": "s3",
+                            "op": "run",
+                            "block": "pass",
+                            "captured": {
+                                "existing": protocol.encode_value("override3"),
+                                "temp3": protocol.encode_value("v"),
+                            },
+                        },
+                    )
+                    r3 = protocol.recv_json(f)
+                    assert r3 is not None and r3["ok"] is False
+                    assert fake_xsh.ctx["existing"] == "orig"
+                    assert "temp3" not in fake_xsh.ctx
+
+                    # 4. stop() while entry is active restores.
+                    mode["kind"] = "stop"
+                    protocol.send_json(
+                        cli,
+                        {
+                            "id": "s4",
+                            "op": "run",
+                            "block": "pass",
+                            "captured": {
+                                "existing": protocol.encode_value(
+                                    "override_stop"
+                                ),
+                                "temp4": protocol.encode_value("v"),
+                            },
+                        },
+                    )
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline:
+                        if fake_xsh.ctx.get("existing") == "override_stop":
+                            break
+                        time.sleep(0.01)
+                    assert fake_xsh.ctx.get("existing") == "override_stop"
+                    srv.stop()
+                    assert fake_xsh.ctx["existing"] == "orig"
+                    assert "temp4" not in fake_xsh.ctx
+        finally:
+            srv.stop()
+
+
+def test_format_restored_comment_rules() -> None:
+    """Formats restored bindings and unset names safely on one line."""
+    assert peer_server._format_restored_comment({}) == ""
+
+    both = peer_server._format_restored_comment(
+        {"x": "before", "issue": peer_server._MISSING}
+    )
+    assert both == "# restored: x='before'; unset: issue"
+
+    only_restored = peer_server._format_restored_comment(
+        {"x": "before", "n": 42}
+    )
+    assert only_restored == "# restored: x='before', n=42"
+
+    only_unset = peer_server._format_restored_comment(
+        {"issue": peer_server._MISSING, "cfg": peer_server._MISSING}
+    )
+    assert only_unset == "# unset: issue, cfg"
+
+    class _BadRepr:
+        def __repr__(self) -> str:
+            raise RuntimeError("bad repr")
+
+    safe = peer_server._format_restored_comment(
+        {
+            "cfg": {f"k{i}": i for i in range(12)},
+            "bad": _BadRepr(),
+            "text": "line1\nline2 " + ("z" * 100),
+            "u": peer_server._MISSING,
+        }
+    )
+    assert "\n" not in safe
+    assert "cfg=<dict, 12 items>" in safe
+    assert "bad=<_BadRepr>" in safe
+    assert "..." in safe
+    assert safe.endswith("; unset: u")
+
+
+def test_write_restored_comment_safe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Writes restore comment line once, handles broken stdout safely."""
+    chunks: list[str] = []
+    flushed = {"n": 0}
+
+    class _Stream:
+        def write(self, s: str) -> int:
+            chunks.append(s)
+            return len(s)
+
+        def flush(self) -> None:
+            flushed["n"] += 1
+
+    monkeypatch.setattr(sys, "stdout", _Stream())
+    peer_server._write_restored_comment("")
+    assert chunks == []
+    peer_server._write_restored_comment("# restored: x='before'")
+    assert chunks == ["# restored: x='before'\n"]
+    assert flushed["n"] == 1
+
+    chunks.clear()
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "__stdout__", _Stream())
+    peer_server._write_restored_comment("# unset: issue")
+    assert chunks == ["# unset: issue\n"]
+
+    class _BrokenStream:
+        def write(self, s: str) -> int:
+            raise OSError("broken pipe")
+
+        def flush(self) -> None:
+            raise OSError("broken flush")
+
+    monkeypatch.setattr(sys, "stdout", _BrokenStream())
+    peer_server._write_restored_comment("# restored: x=1")
+
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "__stdout__", None)
+    peer_server._write_restored_comment("# restored: x=1")
+
+
+def test_capture_restore_emits_terminal_comment_all_exit_paths(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restore line writes to terminal only across every exit path."""
+    fake_events = _make_fake_events()
+    monkeypatch.setattr(builtins, "events", fake_events, raising=False)
+    monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
+
+    term_writes: list[str] = []
+
+    class _TermStdout(io.TextIOBase):
+        encoding = "utf-8"
+        errors = "replace"
+
+        def write(self, s: str) -> int:
+            term_writes.append(s)
+            return len(s)
+
+        def flush(self) -> None:
+            pass
+
+    monkeypatch.setattr(sys, "stdout", _TermStdout())
+    monkeypatch.setattr(sys, "stderr", _TermStdout())
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_rest_") as td:
+        sock_path = os.path.join(td, "p.sock")
+        default_buf = SimpleNamespace(text="", complete_state=None)
+        mode = {"kind": "normal"}
+
+        class _FakeLoop:
+            def call_soon_threadsafe(self, fn: Any) -> None:
+                threading.Thread(target=fn, daemon=True).start()
+
+        app = SimpleNamespace(
+            is_running=True,
+            current_buffer=default_buf,
+            layout=SimpleNamespace(is_searching=False),
+            loop=_FakeLoop(),
+        )
+        sh = SimpleNamespace(
+            prompter=SimpleNamespace(default_buffer=default_buf, app=app),
+            need_more_lines=False,
+        )
+        fake_xsh = SimpleNamespace(
+            env={},
+            ctx={"existing": "orig"},
+            shell=SimpleNamespace(shell=sh),
+        )
+
+        srv_box: list[peer_server._PeerServer] = []
+
+        def validate_and_handle() -> None:
+            default_buf.text = ""
+            kind = mode["kind"]
+            if kind == "normal":
+                fake_events.on_precommand.fire(cmd="x")
+                sys.stdout.write("block_out\n")
+                fake_events.on_postcommand.fire(cmd="x", rtn=0)
+            elif kind == "fail_cmd":
+                fake_events.on_precommand.fire(cmd="false")
+                fake_events.on_postcommand.fire(cmd="false", rtn=1)
+            elif kind == "exc":
+                fake_events.on_precommand.fire(cmd="1/0")
+                with srv_box[0]._entry_lock:
+                    assert srv_box[0]._active_entry is not None
+                    srv_box[0]._active_entry.exc_type = ZeroDivisionError
+                fake_events.on_postcommand.fire(cmd="1/0", rtn=0)
+            elif kind == "interrupt":
+                fake_events.on_precommand.fire(cmd="sleep")
+                with srv_box[0]._entry_lock:
+                    assert srv_box[0]._active_entry is not None
+                    srv_box[0]._active_entry.exc_type = KeyboardInterrupt
+                fake_events.on_postcommand.fire(cmd="sleep", rtn=0)
+            elif kind == "pre_prompt":
+                fake_events.on_pre_prompt.fire()
+            elif kind == "raise":
+                raise RuntimeError("boom in validate")
+            elif kind == "no_cap":
+                fake_events.on_precommand.fire(cmd="plain")
+                sys.stdout.write("plain_out\n")
+                fake_events.on_postcommand.fire(cmd="plain", rtn=0)
+            elif kind == "stop":
+                pass
+
+        default_buf.validate_and_handle = validate_and_handle
+        peer_server.start_peer_server(fake_xsh, sock_path)
+        srv = peer_server._active_server
+        assert srv is not None
+        srv_box.append(srv)
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as cli:
+                cli.settimeout(3.0)
+                cli.connect(sock_path)
+                with cli.makefile("r", encoding="utf-8") as f:
+                    def _run(
+                        rid: str,
+                        captured: dict[str, str],
+                        kind: str,
+                    ) -> dict[str, Any]:
+                        term_writes.clear()
+                        mode["kind"] = kind
+                        protocol.send_json(
+                            cli,
+                            {
+                                "id": rid,
+                                "op": "run",
+                                "block": "pass",
+                                "captured": captured,
+                            },
+                        )
+                        resp = protocol.recv_json(f)
+                        assert resp is not None
+                        return resp
+
+                    r1 = _run(
+                        "e1",
+                        {
+                            "existing": protocol.encode_value("o1"),
+                            "temp": protocol.encode_value(1),
+                        },
+                        "normal",
+                    )
+                    assert r1["rtn"] == 0
+                    assert r1["out"] == "block_out\n"
+                    assert "# restored:" not in r1["out"]
+                    assert r1["err"] == ""
+                    assert r1["commands"] == []
+                    assert "".join(term_writes) == (
+                        "block_out\n# restored: existing='orig'; unset: temp\n"
+                    )
+
+                    r2 = _run(
+                        "e2",
+                        {"existing": protocol.encode_value("o2")},
+                        "fail_cmd",
+                    )
+                    assert r2["rtn"] == 1
+                    assert r2["out"] == ""
+                    assert term_writes == ["# restored: existing='orig'\n"]
+
+                    r3 = _run(
+                        "e3",
+                        {"temp_exc": protocol.encode_value(9)},
+                        "exc",
+                    )
+                    assert r3["rtn"] == 1
+                    assert r3["out"] == ""
+                    assert term_writes == ["# unset: temp_exc\n"]
+
+                    r4 = _run(
+                        "e4",
+                        {"existing": protocol.encode_value("o3")},
+                        "interrupt",
+                    )
+                    assert r4["rtn"] == 130
+                    assert r4["out"] == ""
+                    assert term_writes == ["# restored: existing='orig'\n"]
+
+                    r5 = _run(
+                        "e5",
+                        {
+                            "existing": protocol.encode_value("o4"),
+                            "temp2": protocol.encode_value("v"),
+                        },
+                        "pre_prompt",
+                    )
+                    assert r5["ok"] is False
+                    assert term_writes == [
+                        "# restored: existing='orig'; unset: temp2\n"
+                    ]
+
+                    r6 = _run(
+                        "e6",
+                        {
+                            "existing": protocol.encode_value("o5"),
+                            "temp3": protocol.encode_value("v"),
+                        },
+                        "raise",
+                    )
+                    assert r6["ok"] is False
+                    assert term_writes == [
+                        "# restored: existing='orig'; unset: temp3\n"
+                    ]
+
+                    r7 = _run("e7", {}, "no_cap")
+                    assert r7["rtn"] == 0
+                    assert r7["out"] == "plain_out\n"
+                    assert "".join(term_writes) == "plain_out\n"
+
+                    term_writes.clear()
+                    mode["kind"] = "stop"
+                    protocol.send_json(
+                        cli,
+                        {
+                            "id": "e8",
+                            "op": "run",
+                            "block": "pass",
+                            "captured": {
+                                "existing": protocol.encode_value("o6"),
+                            },
+                        },
+                    )
+                    deadline = time.monotonic() + 2.0
+                    while time.monotonic() < deadline:
+                        if fake_xsh.ctx.get("existing") == "o6":
+                            break
+                        time.sleep(0.01)
+                    assert fake_xsh.ctx.get("existing") == "o6"
+                    srv.stop()
+                    assert fake_xsh.ctx["existing"] == "orig"
+                    assert term_writes == []
+        finally:
+            srv.stop()
