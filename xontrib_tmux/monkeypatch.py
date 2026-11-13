@@ -20,6 +20,7 @@ import libtmux  # type: ignore
 
 from .attach import attach
 from .block import send
+from .pane_text import pane_text
 from .parser_patch import install_parser_patch_hook, patch_xonsh_parser
 
 
@@ -40,6 +41,7 @@ def _send(
 libtmux.Session.send = _send
 libtmux.Window.send = _send
 libtmux.Pane.send = _send
+libtmux.Pane.text = pane_text
 
 libtmux.Session.attach = attach
 _attach = attach

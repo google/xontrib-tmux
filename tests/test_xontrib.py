@@ -32,6 +32,13 @@ def test_session_has_attach_monkeypatch(load_xontrib: Any) -> None:
     assert libtmux.Session.attach == mp._attach
 
 
+def test_pane_has_text_monkeypatch(load_xontrib: Any) -> None:
+    load_xontrib("tmux")
+    from xontrib_tmux.pane_text import pane_text  # type: ignore
+
+    assert libtmux.Pane.text is pane_text
+
+
 def test_attach_xonsh_subproc(load_xontrib: Any, monkeypatch: Any) -> None:
     load_xontrib("tmux")
     session = libtmux.Session(server=libtmux.Server(), session_id="$42")
