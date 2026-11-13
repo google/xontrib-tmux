@@ -34,6 +34,21 @@ $XONTRIBS_AUTOLOAD_DISABLED = ["tmux", ]
 # if you have set this for other xontribs, you should append the value
 ```
 
+### Reading pane text
+
+Call `pane.text(scrollback=False) -> str` on any `libtmux.Pane` to capture clean
+plain text (wrapped rows joined with `-p -J`, ANSI escape sequences omitted,
+per-line trailing whitespace and trailing blank padding rows stripped, with no
+trailing newline):
+
+- `pane.text()` or `pane.text(scrollback=0)`: captures only the visible pane.
+- `pane.text(scrollback=True)`: captures the full scrollback history plus the
+  visible pane.
+- `pane.text(scrollback=N)`: captures the last `N` scrollback lines plus the
+  visible pane (`N > 0`).
+- Raises `ValueError` for negative `scrollback`, `TypeError` for non-`bool`/non-`int`,
+  and `libtmux.exc.LibTmuxException` if the pane is closed or `capture-pane` fails.
+
 ## Development
 
 - activate [pre-commit](https://github.com/pre-commit/pre-commit) hooks
