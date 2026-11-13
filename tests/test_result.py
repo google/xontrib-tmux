@@ -15,6 +15,7 @@
 """Hermetic unit tests for ``xontrib_tmux.result``."""
 
 import asyncio
+from concurrent.futures import CancelledError, wait
 import dataclasses
 import gc
 import threading
@@ -40,6 +41,98 @@ def test_command_record_frozen() -> None:
     assert rec.err == ""
     with pytest.raises(dataclasses.FrozenInstanceError):
         rec.rtn = 1  # type: ignore[misc]
+
+
+def test_peer_future_cancel_without_hook() -> None:
+    f1 = PeerFuture()
+    assert f1.cancel() is True
+    assert f1.cancelled() is True
+    assert f1.cancel() is True
+
+    f_wait = PeerFuture()
+    t = threading.Timer(0.02, f_wait.cancel)
+    t.start()
+    done, not_done = wait([f_wait], timeout=0.5)
+    t.join(timeout=0.5)
+    assert done == {f_wait}
+    assert not_done == set()
+    assert f_wait.cancelled() is True
+
+    f2 = PeerFuture()
+    assert f2.set_running_or_notify_cancel() is True
+    assert f2.cancel() is False
+    f2.set_result(0)
+    assert f2.cancel() is False
+
+
+def test_peer_future_cancel_with_hook_accepts_and_notifies_waiters() -> None:
+    called = 0
+
+    def hook() -> bool:
+        nonlocal called
+        called += 1
+        return True
+
+    f = PeerFuture(cancel_hook=hook)
+    callback_called = threading.Event()
+    f.add_done_callback(lambda _fut: callback_called.set())
+
+    assert f.cancel() is True
+    assert called == 1
+    assert f.cancelled() is True
+    assert f.done() is True
+    assert callback_called.wait(timeout=1.0)
+
+    done, not_done = wait([f], timeout=0.5)
+    assert done == {f}
+    assert not_done == set()
+    assert f.set_running_or_notify_cancel() is False
+    with pytest.raises(CancelledError):
+        f.result()
+    with pytest.raises(CancelledError):
+        f.exception()
+
+
+def test_peer_future_cancel_concurrent_race() -> None:
+    f = PeerFuture()
+    entered = threading.Event()
+    proceed = threading.Event()
+
+    def hook1() -> bool:
+        entered.set()
+        proceed.wait(timeout=1.0)
+        return False
+
+    f._cancel_hook = hook1
+    res1: list[bool] = []
+    t = threading.Thread(target=lambda: res1.append(f.cancel()), daemon=True)
+    t.start()
+    assert entered.wait(timeout=1.0)
+    # Concurrent cancel with hook returning True wins first.
+    f._cancel_hook = lambda: True
+    assert f.cancel() is True
+    proceed.set()
+    t.join(timeout=1.0)
+    assert res1 == [True]
+
+
+def test_peer_future_cancel_with_hook_rejects_and_skips_when_running() -> None:
+    f_reject = PeerFuture(cancel_hook=lambda: False)
+    assert f_reject.cancel() is False
+    assert not f_reject.cancelled()
+    assert not f_reject.done()
+
+    hook_called = False
+
+    def should_not_run() -> bool:
+        nonlocal hook_called
+        hook_called = True
+        return True
+
+    f_running = PeerFuture(cancel_hook=should_not_run)
+    assert f_running.set_running_or_notify_cancel() is True
+    assert f_running.cancel() is False
+    assert hook_called is False
 
 
 def test_peer_result_is_command_pipeline_with_blocking_properties() -> None:
@@ -364,3 +457,47 @@ def test_set_completed_optional_block_out_err_override() -> None:
     assert run.out == "a\nb\n"
     assert run.err == "py-err\n"
     assert [c.out for c in run.commands] == ["a\n"]
+
+
+def test_cancelled_result_does_not_print_on_gc_and_raises_cancelled(
+    capsys: Any,
+) -> None:
+    run = PeerResult(cancel_hook=lambda: True)
+    assert run.future.cancel() is True
+    with pytest.raises(CancelledError):
+        _ = run.rtn
+    del run
+    gc.collect()
+
+    captured = capsys.readouterr()
+    assert captured.err == ""
+
+
+def test_cancelled_result_raises_on_all_waiters_and_silent_gc(
+    capsys: Any,
+) -> None:
+    run = PeerResult(cancel_hook=lambda: True)
+    assert run.future.cancel() is True
+    assert repr(run) == "<PeerResult cancelled>"
+
+    for accessor in (
+        lambda: run.rtn,
+        lambda: run.returncode,
+        lambda: run.out,
+        lambda: run.output,
+        lambda: run.err,
+        lambda: run.errors,
+        lambda: run.lines,
+        lambda: run.commands,
+        lambda: run.end(),
+        lambda: bool(run),
+        lambda: list(run),
+    ):
+        with pytest.raises(CancelledError):
+            accessor()
+
+    unread = PeerResult(cancel_hook=lambda: True)
+    assert unread.future.cancel() is True
+    del unread
+    gc.collect()
+    assert capsys.readouterr().err == ""

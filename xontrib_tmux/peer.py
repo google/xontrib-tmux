@@ -423,40 +423,102 @@ def _wait_ticket_turn(ctrl: _PeerController, ticket: int) -> None:
             raise
 
 
+class _RequestState:
+    """Tracks whether a queued block has been written to the peer socket."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.status = "queued_local"
+        self.peer_cancelled = False
+
+
+def _send_cancel_rpc(ctrl: _PeerController, target_id: str) -> bool:
+    """Contacts the peer to cancel a previously transmitted block."""
+    if ctrl.state.killed:
+        return False
+    if ctrl.is_alive is not None and not ctrl.is_alive():
+        return False
+    err_path = pathlib.Path(f"{ctrl.socket_path}.err")
+    if _read_err_sentinel(err_path) is not None:
+        return False
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        sock.connect(str(ctrl.socket_path))
+        verify_peer_uid(sock)
+        send_json(
+            sock,
+            {
+                "id": uuid.uuid4().hex,
+                "op": "cancel",
+                "target_id": target_id,
+            },
+        )
+        with sock.makefile("r", encoding="utf-8") as stream:
+            resp = recv_json(stream)
+    except (OSError, RuntimeError, PermissionError):
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+    if resp is None or not resp.get("ok", False):
+        return False
+    return bool(resp.get("cancelled", False))
+
+
 def _request_worker(
     ctrl: _PeerController,
     ticket: int,
     req_id: str,
     normalized_block: str,
     record: bool,
+    req_state: _RequestState,
     result: PeerResult,
 ) -> None:
     """Delivers one block in ticket order and awaits the peer's response."""
     sock: socket.socket | None = None
     try:
         _wait_ticket_turn(ctrl, ticket)
+        should_send = True
         try:
+            if result.future.cancelled():
+                should_send = False
+                return
             if ctrl.state.killed:
                 raise RuntimeError("Peer exited")
             sock = _wait_until_ready(ctrl)
-            with ctrl.lock:
-                if ctrl.state.killed:
+            with req_state.lock:
+                if (
+                    req_state.status == "cancelled_local"
+                    or result.future.cancelled()
+                ):
                     sock.close()
                     sock = None
-                    raise RuntimeError("Peer exited")
-                ctrl.active_sockets.add(sock)
-            send_json(
-                sock,
-                {
-                    "id": req_id,
-                    "op": "run",
-                    "block": normalized_block,
-                    "record": record,
-                },
-            )
+                    should_send = False
+                    return
+                with ctrl.lock:
+                    if ctrl.state.killed:
+                        sock.close()
+                        sock = None
+                        raise RuntimeError("Peer exited")
+                    ctrl.active_sockets.add(sock)
+                req_state.status = "sent"
+                send_json(
+                    sock,
+                    {
+                        "id": req_id,
+                        "op": "run",
+                        "block": normalized_block,
+                        "record": record,
+                    },
+                )
         finally:
             with ctrl.send_cond:
                 _advance_active_ticket(ctrl)
+
+        if not should_send or sock is None:
+            return
 
         try:
             with sock.makefile("r", encoding="utf-8") as stream:
@@ -477,6 +539,13 @@ def _request_worker(
             )
             raise RuntimeError(msg)
         if not resp.get("ok", False):
+            if resp.get("cancelled", False):
+                with req_state.lock:
+                    req_state.peer_cancelled = True
+                result._peer_ctrl = None  # type: ignore[attr-defined]
+                result.future._cancel_hook = None
+                result.future.cancel()
+                return
             raise _decode_error_response(resp)
 
         records = [
@@ -490,6 +559,7 @@ def _request_worker(
         ]
         rtn = int(resp.get("rtn", 0))
         result._peer_ctrl = None  # type: ignore[attr-defined]
+        result.future._cancel_hook = None
         result._set_completed(
             rtn,
             records,
@@ -499,9 +569,11 @@ def _request_worker(
         )
     except BaseException as exc:  # noqa: BLE001 - surfaced on PeerResult
         result._peer_ctrl = None  # type: ignore[attr-defined]
+        result.future._cancel_hook = None
         _safe_set_exception(result, exc)
     finally:
         result._peer_ctrl = None  # type: ignore[attr-defined]
+        result.future._cancel_hook = None
         if sock is not None:
             with ctrl.lock:
                 ctrl.active_sockets.discard(sock)
@@ -658,7 +730,27 @@ class RemoteXonsh:
         normalized = _check_syntax_detached(block)
         ctrl = self._ctrl
         req_id = uuid.uuid4().hex
-        result = PeerResult()
+        req_state = _RequestState()
+        ctrl_ref = weakref.ref(ctrl)
+
+        def _cancel_hook() -> bool:
+            c = ctrl_ref()
+            if c is None or c.state.killed:
+                return False
+            if c.is_alive is not None and not c.is_alive():
+                return False
+            err_path = pathlib.Path(f"{c.socket_path}.err")
+            if _read_err_sentinel(err_path) is not None:
+                return False
+            with req_state.lock:
+                if req_state.peer_cancelled:
+                    return True
+                if req_state.status in ("queued_local", "cancelled_local"):
+                    req_state.status = "cancelled_local"
+                    return True
+            return _send_cancel_rpc(c, req_id)
+
+        result = PeerResult(cancel_hook=_cancel_hook)
         # Keep hidden peer alive while this result is pending; cleared by
         # _request_worker's finally block (avoiding a done-callback cycle).
         result._peer_ctrl = ctrl  # type: ignore[attr-defined]
@@ -673,13 +765,14 @@ class RemoteXonsh:
 
         worker = threading.Thread(
             target=_request_worker,
-            args=(ctrl, ticket, req_id, normalized, record, result),
+            args=(ctrl, ticket, req_id, normalized, record, req_state, result),
             daemon=True,
         )
         try:
             worker.start()
         except BaseException:
             result._peer_ctrl = None  # type: ignore[attr-defined]
+            result.future._cancel_hook = None
             raise
         return result
 

@@ -102,7 +102,10 @@ socket (`peer_server.py`), with **no dependency on `tmux`** (it works even when
     `None` / `[]` when `record=False`).
   - `commands`: list of `CommandRecord` entries (`args`, `rtn`, `out`, `err`,
     where `args` is `list[str]`).
-  - `future`: `concurrent.futures.Future[PeerResult]`.
+  - `future`: `concurrent.futures.Future[PeerResult]`. Calling
+    `result.future.cancel()` cancels locally queued blocks immediately and asks
+    the peer to drop blocks still waiting on its queue or prompt; blocks
+    already submitted to the peer's shell return `False`.
   - `end()`: waits for completion and returns `self` (raising any transport
     or peer runtime error; unread exceptions are warned/printed cleanly when the
     result is discarded).

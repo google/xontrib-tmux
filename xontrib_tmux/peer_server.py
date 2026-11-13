@@ -429,6 +429,11 @@ class _PeerServer:
             ]
         ] = collections.deque()
         self._queue_cond = threading.Condition()
+        self._cancelled_ids: set[str] = set()
+        self._committed_ids: set[str] = set()
+        self._pending_run: tuple[
+            str, socket.socket, threading.Lock, threading.Event
+        ] | None = None
         self._wakeup_event = threading.Event()
         self._entry_done = threading.Event()
         self._entry_lock = threading.Lock()
@@ -473,6 +478,9 @@ class _PeerServer:
             while self._queue:
                 _, _, _, ev = self._queue.popleft()
                 ev.set()
+            if self._pending_run is not None:
+                self._pending_run[3].set()
+                self._pending_run = None
             self._queue_cond.notify_all()
         with self._entry_lock:
             active = self._active_entry
@@ -894,15 +902,36 @@ class _PeerServer:
             )
             return True
         op = req.get("op")
-        if op == "run":
-            pending_events[:] = [
-                ev for ev in pending_events if not ev.is_set()
-            ]
-            done_ev = threading.Event()
-            pending_events.append(done_ev)
+        if op == "cancel":
+            self._handle_cancel(
+                req_id, req.get("target_id"), conn, send_lock
+            )
+        elif op == "run":
+            pre_cancelled = False
+            done_ev: threading.Event | None = None
             with self._queue_cond:
-                self._queue.append((req, conn, send_lock, done_ev))
-                self._queue_cond.notify()
+                if isinstance(req_id, str) and req_id in self._cancelled_ids:
+                    self._cancelled_ids.discard(req_id)
+                    self._committed_ids.add(req_id)
+                    pre_cancelled = True
+                else:
+                    pending_events[:] = [
+                        ev for ev in pending_events if not ev.is_set()
+                    ]
+                    done_ev = threading.Event()
+                    pending_events.append(done_ev)
+                    self._queue.append((req, conn, send_lock, done_ev))
+                    self._queue_cond.notify()
+            if pre_cancelled:
+                _send_reply(
+                    conn,
+                    send_lock,
+                    {
+                        "id": req_id,
+                        "ok": False,
+                        "cancelled": True,
+                    },
+                )
         else:
             _send_reply(
                 conn,
@@ -977,32 +1006,127 @@ class _PeerServer:
                         break
             self._drop_conn(conn)
 
+    def _handle_cancel(
+        self,
+        req_id: Any,
+        target_id: Any,
+        conn: socket.socket,
+        send_lock: threading.Lock,
+    ) -> None:
+        if not isinstance(target_id, str):
+            _send_reply(
+                conn, send_lock, {"id": req_id, "ok": True, "cancelled": False}
+            )
+            return
+
+        target_info: tuple[
+            socket.socket, threading.Lock, threading.Event
+        ] | None = None
+        cancelled = False
+        with self._queue_cond:
+            if (
+                self._pending_run is not None
+                and self._pending_run[0] == target_id
+            ):
+                _, t_conn, t_lock, t_ev = self._pending_run
+                self._pending_run = None
+                self._committed_ids.add(target_id)
+                self._wakeup_event.set()
+                target_info = (t_conn, t_lock, t_ev)
+            else:
+                kept: collections.deque[
+                    tuple[
+                        dict[str, Any],
+                        socket.socket,
+                        threading.Lock,
+                        threading.Event,
+                    ]
+                ] = collections.deque()
+                for item in self._queue:
+                    if target_info is None and item[0].get("id") == target_id:
+                        target_info = (item[1], item[2], item[3])
+                        self._committed_ids.add(target_id)
+                    else:
+                        kept.append(item)
+                self._queue = kept
+
+            if target_info is not None:
+                cancelled = True
+            elif (
+                target_id in self._committed_ids
+                or target_id in self._cancelled_ids
+            ):
+                cancelled = False
+            else:
+                self._cancelled_ids.add(target_id)
+                cancelled = True
+
+        if target_info is not None:
+            t_conn, t_lock, t_ev = target_info
+            _send_reply(
+                t_conn,
+                t_lock,
+                {"id": target_id, "ok": False, "cancelled": True},
+            )
+            t_ev.set()
+
+        _send_reply(
+            conn, send_lock, {"id": req_id, "ok": True, "cancelled": cancelled}
+        )
+
     def _pump_loop(self) -> None:
         while not self._stop_event.is_set():
+            cancelled_early = False
             with self._queue_cond:
                 while not self._queue and not self._stop_event.is_set():
                     self._queue_cond.wait()
                 if self._stop_event.is_set():
                     return
                 req, conn, send_lock, done_ev = self._queue.popleft()
+                op = req.get("op")
+                req_id = req.get("id")
+                if op == "run" and isinstance(req_id, str):
+                    if req_id in self._cancelled_ids:
+                        self._cancelled_ids.discard(req_id)
+                        self._committed_ids.add(req_id)
+                        cancelled_early = True
+                    else:
+                        self._pending_run = (req_id, conn, send_lock, done_ev)
 
-            req_id = req.get("id")
+            if cancelled_early:
+                _send_reply(
+                    conn,
+                    send_lock,
+                    {"id": req_id, "ok": False, "cancelled": True},
+                )
+                done_ev.set()
+                continue
+
             block = req.get("block")
             record = bool(req.get("record", True))
             try:
                 normalized = check_block_syntax(block)
             except (SyntaxError, ValueError, TypeError) as exc:
-                _send_reply(
-                    conn,
-                    send_lock,
-                    {
-                        "id": req_id,
-                        "ok": False,
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    },
-                )
-                done_ev.set()
+                was_cancelled = False
+                with self._queue_cond:
+                    if isinstance(req_id, str):
+                        if self._pending_run is None:
+                            was_cancelled = True
+                        else:
+                            self._pending_run = None
+                            self._committed_ids.add(req_id)
+                if not was_cancelled:
+                    _send_reply(
+                        conn,
+                        send_lock,
+                        {
+                            "id": req_id,
+                            "ok": False,
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        },
+                    )
+                    done_ev.set()
                 continue
 
             entry = _PeerEntry(
@@ -1018,8 +1142,13 @@ class _PeerServer:
         self, entry: _PeerEntry, normalized: str
     ) -> None:
         text_to_submit = normalized.rstrip("\n")
+        req_id = entry.req_id
         try:
             while not self._stop_event.is_set():
+                if isinstance(req_id, str):
+                    with self._queue_cond:
+                        if self._pending_run is None:
+                            return
                 sh = getattr(getattr(self.xsh, "shell", None), "shell", None)
                 app = getattr(getattr(sh, "prompter", None), "app", None)
                 if _is_prompt_idle(sh, app):
@@ -1036,9 +1165,20 @@ class _PeerServer:
                         _app: Any = app,
                     ) -> None:
                         try:
-                            if not _is_prompt_idle(_sh, _app):
-                                submit_state["submitted"] = False
-                                return
+                            with self._queue_cond:
+                                if (
+                                    isinstance(req_id, str)
+                                    and self._pending_run is None
+                                ):
+                                    submit_state["cancelled"] = True
+                                    return
+                                if not _is_prompt_idle(_sh, _app):
+                                    submit_state["submitted"] = False
+                                    return
+                                self._pending_run = None
+                                if isinstance(req_id, str):
+                                    self._committed_ids.add(req_id)
+
                             self._entry_done.clear()
                             with self._entry_lock:
                                 self._active_entry = entry
@@ -1072,6 +1212,9 @@ class _PeerServer:
                         self._wakeup_event.clear()
                         continue
 
+                    if submit_state.get("cancelled"):
+                        return
+
                     if "error" in submit_state:
                         exc = submit_state["error"]
                         _send_reply(
@@ -1097,6 +1240,14 @@ class _PeerServer:
                 self._wakeup_event.wait(timeout=0.02)
                 self._wakeup_event.clear()
         finally:
+            if isinstance(req_id, str):
+                with self._queue_cond:
+                    if (
+                        self._pending_run is not None
+                        and self._pending_run[0] == req_id
+                    ):
+                        self._pending_run = None
+                        self._committed_ids.add(req_id)
             entry.done_event.set()
 
 

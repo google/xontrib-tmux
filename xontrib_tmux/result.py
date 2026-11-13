@@ -14,7 +14,7 @@
 
 """Result and future types returned by ``RemoteXonsh.send()``."""
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import CancelledError, Future, InvalidStateError
 from concurrent.futures import _base as _cf_base
 from dataclasses import dataclass
@@ -59,14 +59,60 @@ class CommandRecord:
 
 
 class PeerFuture(Future):
-    """A ``Future`` tracking whether failures were observed by callers."""
+    """A ``Future`` whose ``cancel()`` can be arbitrated by a remote peer."""
 
-    def __init__(self) -> None:
-        """Initializes the future with unobserved-failure tracking state."""
+    def __init__(
+        self,
+        cancel_hook: Callable[[], bool] | None = None,
+    ) -> None:
+        """Initializes the future with an optional peer cancel hook.
+
+        Args:
+            cancel_hook: Zero-argument callable returning ``True`` when the
+                remote peer removed the queued block before submission.
+        """
         super().__init__()
+        self._cancel_hook: Callable[[], bool] | None = cancel_hook
         self._observed: bool = False
         self._active_observers: int = 0
         self._result_finalized: bool = False
+
+    def cancel(self) -> bool:
+        """Cancels the future, delegating to ``_cancel_hook`` if set."""
+        with self._condition:
+            if self._state in (_cf_base.RUNNING, _cf_base.FINISHED):
+                return False
+            if self._state in (
+                _cf_base.CANCELLED,
+                _cf_base.CANCELLED_AND_NOTIFIED,
+            ):
+                return True
+            hook = self._cancel_hook
+
+        if hook is not None and not hook():
+            return self.cancelled()
+
+        with self._condition:
+            if self._state in (_cf_base.RUNNING, _cf_base.FINISHED):
+                return False
+            if self._state in (
+                _cf_base.CANCELLED,
+                _cf_base.CANCELLED_AND_NOTIFIED,
+            ):
+                return True
+            self._state = _cf_base.CANCELLED_AND_NOTIFIED
+            for waiter in self._waiters:
+                waiter.add_cancelled(self)
+            self._condition.notify_all()
+        self._invoke_callbacks()
+        return True
+
+    def set_running_or_notify_cancel(self) -> bool:
+        """Handles ``CANCELLED_AND_NOTIFIED`` without raising an error."""
+        with self._condition:
+            if self._state == _cf_base.CANCELLED_AND_NOTIFIED:
+                return False
+        return super().set_running_or_notify_cancel()
 
     def set_exception(self, exception: BaseException | None) -> None:
         """Sets the exception and reports it if the result was already GC'd."""
@@ -157,11 +203,18 @@ class PeerResult(CommandPipeline):
     __hash__ = object.__hash__
     __eq__ = object.__eq__
 
-    def __init__(self) -> None:
-        """Initializes a pending result without starting a local subprocess."""
+    def __init__(
+        self,
+        cancel_hook: Callable[[], bool] | None = None,
+    ) -> None:
+        """Initializes a pending result without starting a local subprocess.
+
+        Args:
+            cancel_hook: Optional peer-arbitrated cancellation callback.
+        """
         # Intentionally skips CommandPipeline.__init__: there is no local
         # subprocess or pipe; completion is driven by the remote peer.
-        self._future: PeerFuture = PeerFuture()
+        self._future: PeerFuture = PeerFuture(cancel_hook=cancel_hook)
         self._data_lock = threading.RLock()
         self._rtn: int | None = None
         self._records: list[CommandRecord] | None = None

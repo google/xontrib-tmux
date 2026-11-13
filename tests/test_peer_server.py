@@ -1502,3 +1502,181 @@ def test_partial_slow_connection_does_not_block_fast_connection(
                     assert rs["error_type"] == "SyntaxError"
         finally:
             srv.stop()
+
+
+def test_cancel_queued_pending_prearrival_and_running(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_events = _make_fake_events()
+    monkeypatch.setattr(builtins, "events", fake_events, raising=False)
+    monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_cancel_") as td:
+        sock_path = os.path.join(td, "p.sock")
+        default_buf = SimpleNamespace(text="", complete_state=None)
+        started_slow = threading.Event()
+        release_slow = threading.Event()
+        executed: list[str] = []
+
+        class _FakeLoop:
+            def call_soon_threadsafe(self, fn: Any) -> None:
+                threading.Thread(target=fn, daemon=True).start()
+
+        app = SimpleNamespace(
+            is_running=True,
+            current_buffer=default_buf,
+            layout=SimpleNamespace(is_searching=False),
+            loop=_FakeLoop(),
+        )
+
+        def validate_and_handle() -> None:
+            text = default_buf.text
+            executed.append(text)
+            default_buf.text = ""
+            if text == "slow":
+
+                def _finish_slow() -> None:
+                    started_slow.set()
+                    release_slow.wait(timeout=3.0)
+                    fake_events.on_precommand.fire(cmd=text)
+                    fake_events.on_postcommand.fire(cmd=text, rtn=0)
+
+                threading.Thread(target=_finish_slow, daemon=True).start()
+            else:
+                fake_events.on_precommand.fire(cmd=text)
+                fake_events.on_postcommand.fire(cmd=text, rtn=0)
+
+        default_buf.validate_and_handle = validate_and_handle
+        sh = SimpleNamespace(
+            prompter=SimpleNamespace(default_buffer=default_buf, app=app),
+            need_more_lines=False,
+        )
+        fake_xsh = SimpleNamespace(
+            env={}, ctx={}, shell=SimpleNamespace(shell=sh)
+        )
+        peer_server.start_peer_server(fake_xsh, sock_path)
+        srv = peer_server._active_server
+        assert srv is not None
+        try:
+            with (
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c_run,
+                socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c_ctl,
+            ):
+                c_run.settimeout(3.0)
+                c_ctl.settimeout(3.0)
+                c_run.connect(sock_path)
+                c_ctl.connect(sock_path)
+                with (
+                    c_run.makefile("r", encoding="utf-8") as f_run,
+                    c_ctl.makefile("r", encoding="utf-8") as f_ctl,
+                ):
+                    # 1. Pre-arrival cancel registers _cancelled_ids.
+                    protocol.send_json(
+                        c_ctl,
+                        {"id": "c0", "op": "cancel", "target_id": "pre1"},
+                    )
+                    assert protocol.recv_json(f_ctl) == {
+                        "version": 1,
+                        "id": "c0",
+                        "ok": True,
+                        "cancelled": True,
+                    }
+                    protocol.send_json(
+                        c_run, {"id": "pre1", "op": "run", "block": "x = 1"}
+                    )
+                    assert protocol.recv_json(f_run) == {
+                        "version": 1,
+                        "id": "pre1",
+                        "ok": False,
+                        "cancelled": True,
+                    }
+
+                    # 2. Running block cannot be cancelled; queued block can.
+                    protocol.send_json(
+                        c_run, {"id": "b1", "op": "run", "block": "slow"}
+                    )
+                    assert started_slow.wait(timeout=2.0)
+                    protocol.send_json(
+                        c_run, {"id": "b2", "op": "run", "block": "skip_me"}
+                    )
+                    # Wait briefly so b2 sits in srv._queue behind b1.
+                    deadline = time.monotonic() + 1.0
+                    while len(srv._queue) < 1 and time.monotonic() < deadline:
+                        time.sleep(0.01)
+
+                    protocol.send_json(
+                        c_ctl, {"id": "c1", "op": "cancel", "target_id": "b1"}
+                    )
+                    assert protocol.recv_json(f_ctl) == {
+                        "version": 1,
+                        "id": "c1",
+                        "ok": True,
+                        "cancelled": False,
+                    }
+                    protocol.send_json(
+                        c_ctl, {"id": "c2", "op": "cancel", "target_id": "b2"}
+                    )
+                    assert protocol.recv_json(f_ctl) == {
+                        "version": 1,
+                        "id": "c2",
+                        "ok": True,
+                        "cancelled": True,
+                    }
+
+                    release_slow.set()
+                    r_b1 = protocol.recv_json(f_run)
+                    r_b2 = protocol.recv_json(f_run)
+                    assert {r_b1["id"], r_b2["id"]} == {"b1", "b2"}
+                    by_id = {r_b1["id"]: r_b1, r_b2["id"]: r_b2}
+                    assert by_id["b1"]["ok"] is True
+                    assert by_id["b2"] == {
+                        "version": 1,
+                        "id": "b2",
+                        "ok": False,
+                        "cancelled": True,
+                    }
+
+                    # 3. Cancel while popped & waiting on half-typed prompt.
+                    default_buf.text = "half = "
+                    protocol.send_json(
+                        c_run,
+                        {"id": "b3", "op": "run", "block": "never_runs"},
+                    )
+                    deadline = time.monotonic() + 1.0
+                    while srv._pending_run is None:
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.01)
+                    protocol.send_json(
+                        c_ctl, {"id": "c3", "op": "cancel", "target_id": "b3"}
+                    )
+                    assert protocol.recv_json(f_ctl) == {
+                        "version": 1,
+                        "id": "c3",
+                        "ok": True,
+                        "cancelled": True,
+                    }
+                    assert protocol.recv_json(f_run) == {
+                        "version": 1,
+                        "id": "b3",
+                        "ok": False,
+                        "cancelled": True,
+                    }
+                    default_buf.text = ""
+                    srv._wakeup_event.set()
+                    time.sleep(0.05)
+
+                    # Invalid target_id type returns cancelled=False.
+                    protocol.send_json(
+                        c_ctl, {"id": "c4", "op": "cancel", "target_id": 123}
+                    )
+                    assert protocol.recv_json(f_ctl) == {
+                        "version": 1,
+                        "id": "c4",
+                        "ok": True,
+                        "cancelled": False,
+                    }
+            assert executed == ["slow"]
+        finally:
+            release_slow.set()
+            srv.stop()

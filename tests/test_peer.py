@@ -16,6 +16,7 @@
 
 import ast
 from collections.abc import Callable
+from concurrent.futures import CancelledError
 import gc
 import os
 import pathlib
@@ -786,3 +787,129 @@ def test_abandoned_ticket_does_not_stall_later_waiters(
         _advance_active_ticket(ctrl)
     assert t2_done.wait(timeout=1.0)
     th2.join(timeout=1.0)
+
+
+def test_future_cancel_local_and_peer_arbitrated(
+    tmp_path: pathlib.Path,
+) -> None:
+    # 1. Local cancel while still holding before socket exists.
+    unready_sock = _short_sock(tmp_path, "unready_cancel.sock")
+    ctrl = _PeerController(
+        socket_path=unready_sock,
+        start_time=time.monotonic(),
+        is_hidden=False,
+        is_alive=lambda: True,
+    )
+    unready_peer = _peer_from_ctrl(ctrl)
+    try:
+        r_local = unready_peer.send("echo never-sent")
+        assert r_local.future.cancel() is True
+        with pytest.raises(CancelledError):
+            _ = r_local.rtn
+    finally:
+        unready_peer.kill()
+
+    # 2. Dead peer returns False on cancel.
+    dead_sock = _short_sock(tmp_path, "dead_cancel.sock")
+    dead_ctrl = _PeerController(
+        socket_path=dead_sock,
+        start_time=time.monotonic(),
+        is_hidden=False,
+        is_alive=lambda: False,
+    )
+    dead_peer = _peer_from_ctrl(dead_ctrl)
+    r_dead = dead_peer.send("echo dead")
+    assert r_dead.future.cancel() is False
+    try:
+        _ = r_dead.rtn
+    except RuntimeError:
+        pass
+
+    # 2b. Startup .err sentinel returns False on cancel even while queued.
+    err_sock = _short_sock(tmp_path, "err_cancel.sock")
+    pathlib.Path(f"{err_sock}.err").write_text("bad rc", encoding="utf-8")
+    err_ctrl = _PeerController(
+        socket_path=err_sock,
+        start_time=time.monotonic(),
+        is_hidden=False,
+        is_alive=lambda: True,
+    )
+    err_peer = _peer_from_ctrl(err_ctrl)
+    r_err = err_peer.send("echo err")
+    assert r_err.future.cancel() is False
+    with pytest.raises(RuntimeError, match="bad rc"):
+        _ = r_err.rtn
+    pathlib.Path(f"{err_sock}.err").unlink(missing_ok=True)
+
+    # 3. Peer-arbitrated cancel round-trip (accepted vs rejected).
+    sock = _short_sock(tmp_path, "cancel_rt.sock")
+    run_conns: dict[str, socket.socket] = {}
+    run_reqs: dict[str, dict[str, Any]] = {}
+    run_seen = threading.Event()
+    allow_finish = threading.Event()
+
+    def handler(conn: socket.socket, req: dict[str, Any]) -> None:
+        op = req["op"]
+        if op == "run":
+            run_reqs[req["id"]] = req
+            run_conns[req["id"]] = conn
+            run_seen.set()
+            if req["block"].strip() == "echo running":
+                allow_finish.wait(timeout=2.0)
+                send_json(
+                    conn,
+                    {
+                        "id": req["id"],
+                        "ok": True,
+                        "rtn": 0,
+                        "commands": [
+                            {
+                                "args": ["echo", "running"],
+                                "rtn": 0,
+                                "out": "running\n",
+                                "err": "",
+                            }
+                        ],
+                    },
+                )
+            else:
+                allow_finish.wait(timeout=2.0)
+        elif op == "cancel":
+            target_id = req["target_id"]
+            target_req = run_reqs.get(target_id)
+            if target_req and target_req["block"].strip() == "echo queued":
+                target_conn = run_conns[target_id]
+                send_json(
+                    target_conn,
+                    {"id": target_id, "ok": False, "cancelled": True},
+                )
+                send_json(
+                    conn,
+                    {"id": req["id"], "ok": True, "cancelled": True},
+                )
+            else:
+                send_json(
+                    conn,
+                    {"id": req["id"], "ok": True, "cancelled": False},
+                )
+
+    srv = _MockPeerServer(sock, handler).start()
+    try:
+        peer = _peer_from_socket(sock, time.monotonic())
+        running = peer.send("echo running")
+        assert run_seen.wait(timeout=1.0)
+        run_seen.clear()
+        queued = peer.send("echo queued")
+        assert run_seen.wait(timeout=1.0)
+
+        assert running.future.cancel() is False
+        assert queued.future.cancel() is True
+
+        allow_finish.set()
+        assert running.rtn == 0
+        assert running.out == "running\n"
+        with pytest.raises(CancelledError):
+            _ = queued.rtn
+    finally:
+        allow_finish.set()
+        srv.close()
