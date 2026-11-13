@@ -64,6 +64,21 @@ Call `session.attach(...)` on any `libtmux.Session` to view that session:
   positional args inside tmux raises `ValueError`, and switching to a session
   on a different tmux server raises `xontrib_tmux.attach.DifferentTmuxServerError`.
 
+## Window names
+
+By default (`$XONTRIB_TMUX_RENAME_WINDOW = True`), an interactive xonsh shell
+running inside a tmux pane renames its window to `xonsh` on load and after
+each command, and to the first word of the command while running. Set
+`$XONTRIB_TMUX_RENAME_WINDOW = False` (or `"0"` / `"false"`) to leave window
+names untouched — either in your `.xonshrc` (works with both autoload and
+`xontrib load tmux`) or at runtime from the prompt:
+
+```xonsh
+$XONTRIB_TMUX_RENAME_WINDOW = False
+@events.on_chdir
+def _win_cwd(olddir, newdir, **kw): tmux rename-window @(newdir.rsplit("/", 1)[-1] or "/")
+```
+
 ## Development
 
 - activate [pre-commit](https://github.com/pre-commit/pre-commit) hooks

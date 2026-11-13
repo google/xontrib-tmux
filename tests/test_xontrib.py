@@ -452,3 +452,171 @@ def test_precommand_skips_pending_capture_and_unload_disconnects(
     xontrib_tmux._unload_xontrib_(mock_xsh)
     assert len(mock_events.on_precommand) == 0
     assert len(mock_events.on_postcommand) == 0
+
+
+def _make_rename_harness(
+    monkeypatch: Any,
+    env: Any,
+    *,
+    shell: Any = "interactive",
+    rc_files: Any = (),
+) -> tuple[Any, Any, Any]:
+    import xontrib_tmux  # type: ignore
+
+    fake_window = MagicMock()
+    monkeypatch.setattr(xontrib_tmux, "curtmuxw", lambda: fake_window)
+
+    class FakeEvent(set):
+        def __call__(self, fn: Any) -> Any:
+            self.add(fn)
+            return fn
+
+        def fire(self, **kwargs: Any) -> None:
+            for fn in list(self):
+                fn(**kwargs)
+
+    mock_events = SimpleNamespace(
+        on_precommand=FakeEvent(),
+        on_postcommand=FakeEvent(),
+        on_post_rc=FakeEvent(),
+    )
+    monkeypatch.setattr(builtins, "events", mock_events, raising=False)
+
+    mock_xsh = SimpleNamespace(
+        ctx={},
+        env=env,
+        shell=shell,
+        rc_files=rc_files,
+        builtins=mock_events,
+    )
+    return xontrib_tmux, fake_window, (mock_xsh, mock_events)
+
+
+def test_rename_window_env_registration_and_unset_default(
+    monkeypatch: Any,
+) -> None:
+    from xonsh.environ import Env  # type: ignore
+
+    env = Env()
+    xt, fake_window, (xsh, events) = _make_rename_harness(monkeypatch, env)
+
+    xt._load_xontrib_(xsh)
+    try:
+        detail = env.get_docs("XONTRIB_TMUX_RENAME_WINDOW")
+        assert detail.doc
+        assert env["XONTRIB_TMUX_RENAME_WINDOW"] is True
+
+        fake_window.rename_window.assert_called_once_with("xonsh")
+        fake_window.rename_window.reset_mock()
+
+        events.on_precommand.fire(cmd="vim notes.txt")
+        fake_window.rename_window.assert_called_once_with("vim")
+
+        fake_window.rename_window.reset_mock()
+        events.on_postcommand.fire()
+        fake_window.rename_window.assert_called_once_with("xonsh")
+    finally:
+        xt._unload_xontrib_(xsh)
+
+
+@pytest.mark.parametrize("initial", [False, "0", "false", "OFF", "no"])
+def test_rename_window_false_before_load_skips_all_renames(
+    monkeypatch: Any, initial: Any
+) -> None:
+    from xonsh.environ import Env  # type: ignore
+
+    env = Env()
+    env["XONTRIB_TMUX_RENAME_WINDOW"] = initial
+    xt, fake_window, (xsh, events) = _make_rename_harness(monkeypatch, env)
+
+    xt._load_xontrib_(xsh)
+    try:
+        fake_window.rename_window.assert_not_called()
+        events.on_precommand.fire(cmd="vim notes.txt")
+        events.on_postcommand.fire()
+        fake_window.rename_window.assert_not_called()
+    finally:
+        xt._unload_xontrib_(xsh)
+
+
+def test_rename_window_rc_post_load_assignment_respected(
+    monkeypatch: Any,
+) -> None:
+    from xonsh.environ import Env  # type: ignore
+
+    # Case 1: `xontrib load tmux` precedes `$XONTRIB_TMUX_RENAME_WINDOW = False`
+    env = Env()
+    xt, fake_window, (xsh, events) = _make_rename_harness(
+        monkeypatch, env, shell=None, rc_files=None
+    )
+    xt._load_xontrib_(xsh)
+    try:
+        fake_window.rename_window.assert_not_called()
+        env["XONTRIB_TMUX_RENAME_WINDOW"] = False
+        events.on_post_rc.fire()
+        fake_window.rename_window.assert_not_called()
+    finally:
+        xt._unload_xontrib_(xsh)
+
+    # Case 2: `xontrib load tmux` in rc with var unset renames on post_rc
+    env2 = Env()
+    xt2, fake_window2, (xsh2, events2) = _make_rename_harness(
+        monkeypatch, env2, shell=None, rc_files=None
+    )
+    xt2._load_xontrib_(xsh2)
+    try:
+        fake_window2.rename_window.assert_not_called()
+        events2.on_post_rc.fire()
+        fake_window2.rename_window.assert_called_once_with("xonsh")
+    finally:
+        xt2._unload_xontrib_(xsh2)
+
+
+def test_rename_window_runtime_toggle_and_plain_dict_env(
+    monkeypatch: Any,
+) -> None:
+    from xonsh.environ import Env  # type: ignore
+
+    env = Env()
+    xt, fake_window, (xsh, events) = _make_rename_harness(monkeypatch, env)
+    xt._load_xontrib_(xsh)
+    try:
+        fake_window.rename_window.assert_called_once_with("xonsh")
+
+        # Toggle off using string and bool forms: existing window name preserved
+        for off_val in ("0", "false", False):
+            env["XONTRIB_TMUX_RENAME_WINDOW"] = off_val
+            assert env["XONTRIB_TMUX_RENAME_WINDOW"] is False
+            fake_window.rename_window.reset_mock()
+            events.on_precommand.fire(cmd="htop")
+            events.on_postcommand.fire()
+            fake_window.rename_window.assert_not_called()
+
+        # Toggle back on: takes effect on the next command
+        for on_val in ("1", "true", True):
+            env["XONTRIB_TMUX_RENAME_WINDOW"] = on_val
+            assert env["XONTRIB_TMUX_RENAME_WINDOW"] is True
+            fake_window.rename_window.reset_mock()
+            events.on_precommand.fire(cmd="htop")
+            fake_window.rename_window.assert_called_once_with("htop")
+            fake_window.rename_window.reset_mock()
+            events.on_postcommand.fire()
+            fake_window.rename_window.assert_called_once_with("xonsh")
+    finally:
+        xt._unload_xontrib_(xsh)
+
+    # Defensive fallback when xsh.env is a plain dict without .register
+    plain_env: dict[str, Any] = {"XONTRIB_TMUX_RENAME_WINDOW": "0"}
+    xt2, fw2, (xsh2, ev2) = _make_rename_harness(monkeypatch, plain_env)
+    xt2._load_xontrib_(xsh2)
+    try:
+        fw2.rename_window.assert_not_called()
+        plain_env["XONTRIB_TMUX_RENAME_WINDOW"] = "false"
+        ev2.on_precommand.fire(cmd="ls")
+        fw2.rename_window.assert_not_called()
+
+        plain_env["XONTRIB_TMUX_RENAME_WINDOW"] = "true"
+        ev2.on_precommand.fire(cmd="ls")
+        fw2.rename_window.assert_called_once_with("ls")
+    finally:
+        xt2._unload_xontrib_(xsh2)
