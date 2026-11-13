@@ -18,10 +18,12 @@ import builtins
 from collections.abc import Mapping
 from typing import Any, Callable, Optional
 
+from . import parser_patch
 from .block import TmuxMacro, is_pending_capture_cmd
 from .commands import curtmuxp, curtmuxs, curtmuxw, tmuxp, tmuxs, tmuxw
 from .monkeypatch import *
 from .parser_patch import install_parser_patch_hook, patch_xonsh_parser
+from .peer import RemoteXonsh
 
 
 _RENAME_ENV_VAR = "XONTRIB_TMUX_RENAME_WINDOW"
@@ -87,14 +89,17 @@ def _load_xontrib_(xsh: Any, **kwargs: Any) -> None:
     install_parser_patch_hook()
     patch_xonsh_parser()
 
-    # Make convenience functions available at the top level of the shell
+    # Make convenience functions and RemoteXonsh available in the shell
+    xsh.ctx['RemoteXonsh'] = RemoteXonsh
     xsh.ctx['tmuxw'] = tmuxw
     xsh.ctx['tmuxs'] = tmuxs
     xsh.ctx['tmuxp'] = tmuxp
 
     _register_rename_env(xsh)
 
-    if w := curtmuxw():
+    if not getattr(parser_patch, "_is_hidden_peer", False) and (
+        w := curtmuxw()
+    ):
         events = getattr(
             builtins, "events", getattr(xsh, "builtins", None)
         )  # type: ignore
@@ -142,6 +147,7 @@ def _load_xontrib_(xsh: Any, **kwargs: Any) -> None:
 def _unload_xontrib_(xsh: Any) -> None:
     """Unloads the xontrib extension from the active xonsh session."""
     global _precommand_handler, _postcommand_handler, _post_rc_handler
+    xsh.ctx.pop('RemoteXonsh', None)
     xsh.ctx.pop('tmuxw', None)
     xsh.ctx.pop('tmuxs', None)
     xsh.ctx.pop('tmuxp', None)

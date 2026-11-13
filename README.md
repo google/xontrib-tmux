@@ -79,6 +79,52 @@ $XONTRIB_TMUX_RENAME_WINDOW = False
 def _win_cwd(olddir, newdir, **kw): tmux rename-window @(newdir.rsplit("/", 1)[-1] or "/")
 ```
 
+### Background xonsh peers (`RemoteXonsh`)
+
+`RemoteXonsh` spawns a background interactive xonsh peer on a hidden
+pseudo-terminal (`pty.openpty()`) and communicates with it over a local Unix
+socket (`peer_server.py`), with **no dependency on `tmux`** (it works even when
+`tmux` is not installed or running).
+
+- `peer = RemoteXonsh()` starts an isolated interactive peer; it can be used
+  as a context manager (`with RemoteXonsh() as peer: ...`) and also terminates
+  the child process on `peer.kill()`, when garbage-collected after any
+  in-flight blocks finish, or at interpreter exit.
+- `peer.send(block=None, /, record=True)`:
+  - Call with a source string (`peer.send("x = 1\necho @(x)")`) to run a block
+    and return a `PeerResult`.
+  - Use as a xonsh macro (`with! peer.send() as r:` or `with! peer.send():`) to
+    capture the block body without running it in the caller, returning a
+    `PeerResult` bound to `as` when provided.
+- `PeerResult`:
+  - `rtn`: return code of the last executed statement (or first failing command).
+  - `out`, `err`, `lines`: captured stdout/stderr strings and output lines (or
+    `None` / `[]` when `record=False`).
+  - `commands`: list of `CommandRecord` entries (`args`, `rtn`, `out`, `err`,
+    where `args` is `list[str]`).
+  - `future`: `concurrent.futures.Future[PeerResult]`.
+  - `end()`: waits for completion and returns `self` (raising any transport
+    or peer runtime error; unread exceptions are warned/printed cleanly when the
+    result is discarded).
+  - `bool(result)` is `True` when `rtn == 0` and no exception occurred.
+
+Blocks sent to a peer run one at a time as whole entries in arrival order, with
+the sender's submission order preserved.
+
+## Known issues
+
+- **Exit status `0` reported for a failing subprocess when recording is on**:
+  With `record=True` (the default for sent blocks, which enables
+  `$XONSH_CAPTURE_ALWAYS`), xonsh 0.24 can occasionally report exit status `0`
+  for a subprocess command that actually exited non-zero (measured at ~3 per
+  1,000 commands under load). This is an upstream race in xonsh's threaded
+  subprocess handling (`PopenThread` / `proc_untraced_waitpid` racing with
+  `subprocess.Popen`'s `_waitpid_lock` and hitting `ECHILD`), not specific to
+  this plugin. Passing `record=False` leaves `$XONSH_CAPTURE_ALWAYS` disabled
+  and avoids xonsh's threaded subprocess path (measured `0/1,000` failures
+  with `record=False`, vs. `3/1,000` with `$XONSH_CAPTURE_ALWAYS` enabled), at
+  the cost of not recording `out`/`err`/per-command output.
+
 ## Development
 
 - activate [pre-commit](https://github.com/pre-commit/pre-commit) hooks

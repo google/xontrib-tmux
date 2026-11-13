@@ -620,3 +620,17 @@ def test_rename_window_runtime_toggle_and_plain_dict_env(
         fw2.rename_window.assert_called_once_with("ls")
     finally:
         xt2._unload_xontrib_(xsh2)
+
+
+def test_hidden_peer_skips_window_renaming(monkeypatch: Any) -> None:
+    xt, fake_window, (xsh, events) = _make_rename_harness(monkeypatch, {})
+    monkeypatch.setattr(xt.parser_patch, "_is_hidden_peer", True)
+    xt._load_xontrib_(xsh)
+    try:
+        fake_window.rename_window.assert_not_called()
+        assert len(events.on_precommand) == 0
+        assert len(events.on_postcommand) == 0
+        assert "RemoteXonsh" in xsh.ctx
+    finally:
+        xt._unload_xontrib_(xsh)
+        assert "RemoteXonsh" not in xsh.ctx
