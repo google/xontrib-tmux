@@ -110,9 +110,14 @@ socket (`peer_server.py`), with **no dependency on `tmux`** (it works even when
     or peer runtime error; unread exceptions are warned/printed cleanly when the
     result is discarded).
   - `bool(result)` is `True` when `rtn == 0` and no exception occurred.
+- `peer.env`, `peer.ctx`, `peer.lastcmd`, and `peer.kill()`: inspect or mutate
+  the peer's environment variables, Python namespace, and last command
+  (`EnvProxy`, `CtxProxy`, and `LastCmdProxy`, guarding against self-wait
+  deadlocks on the peer's own main thread), or terminate the peer explicitly.
 
 Blocks sent to a peer run one at a time as whole entries in arrival order, with
-the sender's submission order preserved.
+the sender's submission order preserved and `env`/`ctx` operations serialized
+strictly between blocks.
 
 ## Known issues
 

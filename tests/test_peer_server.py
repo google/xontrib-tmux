@@ -567,6 +567,7 @@ def test_start_peer_server_run_errors_and_kill(
         assert srv is not None
         try:
             assert peer_server.is_hidden_peer() is True
+            assert peer_server.current_peer_socket_path() == sock_path
 
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as cli:
                 cli.settimeout(3.0)
@@ -1371,7 +1372,7 @@ def test_peer_server_run_interleaves_subproc_and_python_output(
 def test_sequential_connections_preserve_arrival_order(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Separate-socket run ops preserve arrival order without overtake."""
+    """Separate-socket ops preserve send order without accept overtake."""
     fake_events = _make_fake_events()
     monkeypatch.setattr(builtins, "events", fake_events, raising=False)
     monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
@@ -1397,25 +1398,19 @@ def test_sequential_connections_preserve_arrival_order(
         fake_xsh = SimpleNamespace(
             env={}, ctx={}, shell=SimpleNamespace(shell=sh)
         )
-        seen: list[str] = []
 
         def validate_and_handle() -> None:
-            text = default_buf.text
             default_buf.text = ""
-            fake_events.on_precommand.fire(cmd=text)
-            seen.append(text)
-            fake_events.on_postcommand.fire(cmd=text, rtn=0)
+            fake_events.on_precommand.fire(cmd="set")
+            fake_xsh.ctx["after_run"] = fake_xsh.ctx.get("pending_val")
+            fake_events.on_postcommand.fire(cmd="set", rtn=0)
 
         default_buf.validate_and_handle = validate_and_handle
         peer_server.start_peer_server(fake_xsh, sock_path)
         srv = peer_server._active_server
         assert srv is not None
         try:
-            expected: list[str] = []
-            for i in range(50):
-                b1 = f"echo a{i}"
-                b2 = f"echo b{i}"
-                expected.extend([b1, b2])
+            for i in range(100):
                 with (
                     socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c1,
                     socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c2,
@@ -1424,11 +1419,18 @@ def test_sequential_connections_preserve_arrival_order(
                     c2.settimeout(3.0)
                     c1.connect(sock_path)
                     protocol.send_json(
-                        c1, {"id": f"a-{i}", "op": "run", "block": b1}
+                        c1,
+                        {
+                            "id": f"s-{i}",
+                            "op": "ctx_set",
+                            "key": "seq",
+                            "value": protocol.encode_value(i),
+                        },
                     )
                     c2.connect(sock_path)
                     protocol.send_json(
-                        c2, {"id": f"b-{i}", "op": "run", "block": b2}
+                        c2,
+                        {"id": f"g-{i}", "op": "ctx_get", "key": "seq"},
                     )
                     with (
                         c1.makefile("r", encoding="utf-8") as f1,
@@ -1438,7 +1440,39 @@ def test_sequential_connections_preserve_arrival_order(
                         r2 = protocol.recv_json(f2)
                         assert r1 is not None and r1["ok"] is True
                         assert r2 is not None and r2["ok"] is True
-            assert seen == expected
+                        assert protocol.decode_value(r2["value"]) == i
+
+            for i in range(25):
+                fake_xsh.ctx["pending_val"] = i
+                with (
+                    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c1,
+                    socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as c2,
+                ):
+                    c1.settimeout(3.0)
+                    c2.settimeout(3.0)
+                    c1.connect(sock_path)
+                    protocol.send_json(
+                        c1,
+                        {"id": f"r-{i}", "op": "run", "block": "pass"},
+                    )
+                    c2.connect(sock_path)
+                    protocol.send_json(
+                        c2,
+                        {
+                            "id": f"rg-{i}",
+                            "op": "ctx_get",
+                            "key": "after_run",
+                        },
+                    )
+                    with (
+                        c1.makefile("r", encoding="utf-8") as f1,
+                        c2.makefile("r", encoding="utf-8") as f2,
+                    ):
+                        r1 = protocol.recv_json(f1)
+                        r2 = protocol.recv_json(f2)
+                        assert r1 is not None and r1["ok"] is True
+                        assert r2 is not None and r2["ok"] is True
+                        assert protocol.decode_value(r2["value"]) == i
         finally:
             srv.stop()
 
@@ -1679,4 +1713,207 @@ def test_cancel_queued_pending_prearrival_and_running(
             assert executed == ["slow"]
         finally:
             release_slow.set()
+            srv.stop()
+
+
+def test_env_ctx_and_lastcmd_ops(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_events = _make_fake_events()
+    monkeypatch.setattr(builtins, "events", fake_events, raising=False)
+    monkeypatch.setattr(peer_server, "_install_global_hooks", lambda: None)
+
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_state_") as td:
+        sock_path = os.path.join(td, "p.sock")
+        default_buf = SimpleNamespace(text="", complete_state=None)
+        prompt_submissions: list[str] = []
+
+        class _FakeLoop:
+            def call_soon_threadsafe(self, fn: Any) -> None:
+                threading.Thread(target=fn, daemon=True).start()
+
+        app = SimpleNamespace(
+            is_running=True,
+            current_buffer=default_buf,
+            layout=SimpleNamespace(is_searching=False),
+            loop=_FakeLoop(),
+        )
+        default_buf.validate_and_handle = lambda: prompt_submissions.append(
+            default_buf.text
+        )
+        sh = SimpleNamespace(
+            prompter=SimpleNamespace(default_buffer=default_buf, app=app),
+            need_more_lines=False,
+        )
+        fake_xsh = SimpleNamespace(
+            env={"PATH": ["/bin"]},
+            ctx={"existing": 7},
+            lastcmd=None,
+            shell=SimpleNamespace(shell=sh),
+        )
+        peer_server.start_peer_server(fake_xsh, sock_path)
+        srv = peer_server._active_server
+        assert srv is not None
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as cli:
+                cli.settimeout(3.0)
+                cli.connect(sock_path)
+                with cli.makefile("r", encoding="utf-8") as f:
+                    # lastcmd_get when lastcmd is None.
+                    protocol.send_json(
+                        cli, {"id": "lc0", "op": "lastcmd_get"}
+                    )
+                    assert protocol.recv_json(f) == {
+                        "version": 1,
+                        "id": "lc0",
+                        "ok": True,
+                        "args": None,
+                        "rtn": None,
+                        "out": None,
+                        "err": None,
+                    }
+
+                    # Captured lastcmd.
+                    fake_xsh.lastcmd = SimpleNamespace(
+                        args=["echo", "clang"],
+                        returncode=0,
+                        lines=["clang\n"],
+                        errors=None,
+                        spec=SimpleNamespace(
+                            captured_stdout=object(), captured_stderr=None
+                        ),
+                    )
+                    protocol.send_json(
+                        cli, {"id": "lc1", "op": "lastcmd_get"}
+                    )
+                    assert protocol.recv_json(f) == {
+                        "version": 1,
+                        "id": "lc1",
+                        "ok": True,
+                        "args": ["echo", "clang"],
+                        "rtn": 0,
+                        "out": "clang\n",
+                        "err": "",
+                    }
+
+                    # Uncaptured lastcmd.
+                    fake_xsh.lastcmd = SimpleNamespace(
+                        args=["ls"],
+                        returncode=2,
+                        lines=["ignored"],
+                        errors="err",
+                        spec=SimpleNamespace(
+                            captured_stdout=None, captured_stderr=None
+                        ),
+                    )
+                    protocol.send_json(
+                        cli, {"id": "lc2", "op": "lastcmd_get"}
+                    )
+                    assert protocol.recv_json(f) == {
+                        "version": 1,
+                        "id": "lc2",
+                        "ok": True,
+                        "args": ["ls"],
+                        "rtn": 2,
+                        "out": None,
+                        "err": None,
+                    }
+
+                    # env_* and ctx_* CRUD + missing KeyError + bad payload.
+                    for prefix in ("env", "ctx"):
+                        protocol.send_json(
+                            cli,
+                            {
+                                "id": f"{prefix}1",
+                                "op": f"{prefix}_set",
+                                "key": "CC",
+                                "value": protocol.encode_value("clang"),
+                            },
+                        )
+                        assert protocol.recv_json(f)["ok"] is True
+
+                        protocol.send_json(
+                            cli,
+                            {
+                                "id": f"{prefix}2",
+                                "op": f"{prefix}_contains",
+                                "key": "CC",
+                            },
+                        )
+                        assert protocol.recv_json(f)["contains"] is True
+
+                        protocol.send_json(
+                            cli,
+                            {
+                                "id": f"{prefix}3",
+                                "op": f"{prefix}_get",
+                                "key": "CC",
+                            },
+                        )
+                        resp_get = protocol.recv_json(f)
+                        assert (
+                            protocol.decode_value(resp_get["value"]) == "clang"
+                        )
+
+                        protocol.send_json(
+                            cli, {"id": f"{prefix}4", "op": f"{prefix}_keys"}
+                        )
+                        assert "CC" in protocol.recv_json(f)["keys"]
+
+                        protocol.send_json(
+                            cli,
+                            {
+                                "id": f"{prefix}5",
+                                "op": f"{prefix}_del",
+                                "key": "CC",
+                            },
+                        )
+                        assert protocol.recv_json(f)["ok"] is True
+
+                        protocol.send_json(
+                            cli,
+                            {
+                                "id": f"{prefix}6",
+                                "op": f"{prefix}_get",
+                                "key": "CC",
+                            },
+                        )
+                        r_miss = protocol.recv_json(f)
+                        assert r_miss["ok"] is False
+                        assert r_miss["error_type"] == "KeyError"
+
+                        protocol.send_json(
+                            cli,
+                            {
+                                "id": f"{prefix}7",
+                                "op": f"{prefix}_del",
+                                "key": "CC",
+                            },
+                        )
+                        assert protocol.recv_json(f)["error_type"] == "KeyError"
+
+                    # Corrupt value on ctx_set fails cleanly.
+                    protocol.send_json(
+                        cli,
+                        {
+                            "id": "badset",
+                            "op": "ctx_set",
+                            "key": "k",
+                            "value": "!!!",
+                        },
+                    )
+                    assert protocol.recv_json(f)["ok"] is False
+
+                    # Unpicklable value on ctx_get fails cleanly.
+                    class _NoPickle:
+                        def __reduce__(self) -> Any:
+                            raise TypeError("cannot pickle")
+
+                    fake_xsh.ctx["nopickle"] = _NoPickle()
+                    protocol.send_json(
+                        cli,
+                        {"id": "badget", "op": "ctx_get", "key": "nopickle"},
+                    )
+                    assert protocol.recv_json(f)["ok"] is False
+
+                    assert prompt_submissions == []
+        finally:
             srv.stop()

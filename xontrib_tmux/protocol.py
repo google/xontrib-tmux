@@ -14,6 +14,7 @@
 
 """Wire protocol, socket security, and syntax checking for peer xonsh shells."""
 
+import base64
 import builtins
 import itertools
 import json
@@ -297,3 +298,31 @@ def recv_json(f: IO[str]) -> dict[str, Any] | None:
             f"got {version!r}"
         )
     return msg
+
+
+def encode_value(val: Any) -> str:
+    """Serializes ``val`` with ``dill`` and encodes as an ASCII base64 string.
+
+    Args:
+        val: Arbitrary picklable Python value.
+
+    Returns:
+        Base64-encoded ASCII string of the ``dill`` payload.
+    """
+    import dill
+
+    return base64.b64encode(dill.dumps(val)).decode("ascii")
+
+
+def decode_value(b64: str) -> Any:
+    """Decodes a base64 ``dill`` payload produced by :func:`encode_value`.
+
+    Args:
+        b64: Base64-encoded ASCII string.
+
+    Returns:
+        The unpickled Python value.
+    """
+    import dill
+
+    return dill.loads(base64.b64decode(b64.encode("ascii")))

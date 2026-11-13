@@ -18,10 +18,13 @@ from collections.abc import Iterator
 from concurrent.futures import CancelledError
 import os
 import pathlib
+import signal
+import threading
 import time
 from typing import Any
 
 import pytest
+from xonsh.completers.python import attr_complete
 
 from xontrib_tmux import RemoteXonsh
 
@@ -140,3 +143,172 @@ def test_cancel_while_busy_and_behind_half_typed_prompt(
         == "False\n"
     )
     assert worker.send("echo recovered").out == "recovered\n"
+
+
+def test_env_ctx_lastcmd_copy_semantics_and_completion(
+    xonsh_execer: Any, spawn_peer: Any
+) -> None:
+    del xonsh_execer
+    worker = spawn_peer()
+
+    # Before any command runs, all four lastcmd attributes are None.
+    assert worker.lastcmd.args is None
+    assert worker.lastcmd.rtn is None
+    assert worker.lastcmd.out is None
+    assert worker.lastcmd.err is None
+
+    worker.env["CC"] = "clang"
+    worker.ctx["target"] = "release"
+    worker.ctx["items"] = [1, 2]
+    assert "CC" in worker.env
+    assert "target" in worker.ctx
+    assert len(worker.env) >= 1
+    assert "CC" in list(worker.env)
+    assert worker.env.get("NO_SUCH_VAR_M2", "fallback") == "fallback"
+
+    # Copy semantics: mutating fetched list does not mutate remote peer.
+    path_copy = worker.env["PATH"]
+    path_copy.append("/bogus_m2_path")
+    assert "/bogus_m2_path" not in worker.env["PATH"]
+
+    ctx_copy = worker.ctx["items"]
+    ctx_copy.append(99)
+    assert worker.ctx["items"] == [1, 2]
+
+    # Unpicklable values raise locally without reaching peer.
+    unpicklable = (i for i in range(2))
+    with pytest.raises(TypeError):
+        worker.env["BAD"] = unpicklable
+    with pytest.raises(TypeError):
+        worker.ctx["BAD"] = (i for i in range(2))
+
+    r1 = worker.send("echo $CC @(target)")
+    assert r1.rtn == 0
+    assert r1.out == "clang release\n"
+    assert worker.lastcmd.args == ["echo", "clang", "release"]
+    assert worker.lastcmd.rtn == 0
+    assert worker.lastcmd.out == "clang release\n"
+    assert worker.lastcmd.err == ""
+
+    # Delete + KeyError checks.
+    del worker.env["CC"]
+    assert "CC" not in worker.env
+    with pytest.raises(KeyError):
+        _ = worker.env["CC"]
+    with pytest.raises(KeyError):
+        del worker.env["CC"]
+
+    del worker.ctx["items"]
+    assert "items" not in worker.ctx
+    with pytest.raises(KeyError):
+        _ = worker.ctx["items"]
+
+    # Tab completion while busy must not block, while env/lastcmd wait cleanly.
+    busy = worker.send("sleep 0.8\n__xonsh__.env['AFTER_SLEEP'] = 'yes'")
+    t0 = time.monotonic()
+    c_worker = attr_complete(
+        "worker.", {"worker": worker}, lambda o, a: o.startswith(a)
+    )
+    c_last = attr_complete(
+        "worker.lastcmd.", {"worker": worker}, lambda o, a: o.startswith(a)
+    )
+    assert time.monotonic() - t0 < 0.2
+    assert {"worker.env[", "worker.ctx[", "worker.lastcmd"} <= set(c_worker)
+    assert {
+        "worker.lastcmd.args",
+        "worker.lastcmd.rtn",
+        "worker.lastcmd.out",
+        "worker.lastcmd.err",
+    } <= set(c_last)
+    assert worker.env["AFTER_SLEEP"] == "yes"
+    assert busy.rtn == 0
+
+
+def test_callback_chaining_on_background_thread(spawn_peer: Any) -> None:
+    worker = spawn_peer()
+    done = threading.Event()
+    chained_outputs: list[Any] = []
+    chained_errors: list[BaseException] = []
+
+    def _on_done(fut: Any) -> None:
+        try:
+            assert fut.result() == 0
+            r2 = worker.send("echo chained-step\nprint('py-chained')")
+            chained_outputs.append((r2.rtn, r2.out))
+        except BaseException as exc:  # noqa: BLE001
+            chained_errors.append(exc)
+        finally:
+            done.set()
+
+    r1 = worker.send("echo first-step")
+    r1.future.add_done_callback(_on_done)
+    assert r1.out == "first-step\n"
+    assert done.wait(timeout=10.0)
+    assert chained_errors == []
+    assert chained_outputs == [(0, "chained-step\npy-chained\n")]
+
+
+def test_self_send_and_self_wait_inside_live_peer(spawn_peer: Any) -> None:
+    worker = spawn_peer()
+    sock_str = str(worker._socket_path)
+    worker.ctx["self_sock"] = sock_str
+
+    res = worker.send(
+        "import pathlib, time\n"
+        "from xontrib_tmux import RemoteXonsh\n"
+        "from xontrib_tmux.peer import _PeerController\n"
+        "ctrl = _PeerController(\n"
+        "    socket_path=pathlib.Path(self_sock),\n"
+        "    start_time=time.monotonic(),\n"
+        "    is_hidden=False,\n"
+        "    is_alive=lambda: True,\n"
+        ")\n"
+        "me = RemoteXonsh.__new__(RemoteXonsh)\n"
+        "me._ctrl = ctrl\n"
+        "me._socket_path = ctrl.socket_path\n"
+        "r_self = me.send(\"__xonsh__.ctx['self_ran'] = True\\n"
+        "echo from-self\")\n"
+        "errors = []\n"
+        "for fn in (\n"
+        "    lambda: r_self.rtn,\n"
+        "    lambda: r_self.future.result(),\n"
+        "    lambda: me.env['PATH'],\n"
+        "    lambda: me.ctx['self_sock'],\n"
+        "    lambda: me.lastcmd.rtn,\n"
+        "):\n"
+        "    try:\n"
+        "        fn()\n"
+        "    except RuntimeError as exc:\n"
+        "        errors.append(str(exc))\n"
+        "__xonsh__.ctx['self_errors'] = errors\n"
+    )
+    assert res.rtn == 0
+    errors = worker.ctx["self_errors"]
+    assert len(errors) == 5
+    assert all("Cannot wait on this shell's own peer" in msg for msg in errors)
+
+    # Queued self-send ran after the outer entry finished.
+    assert worker.ctx["self_ran"] is True
+    assert worker.lastcmd.args == ["echo", "from-self"]
+
+
+def test_env_wait_abandoned_on_keyboard_interrupt(spawn_peer: Any) -> None:
+    worker = spawn_peer()
+    assert worker.send("echo warm").rtn == 0
+
+    busy = worker.send("sleep 1.0")
+    time.sleep(0.15)
+    timer = threading.Timer(
+        0.15, os.kill, args=(os.getpid(), signal.SIGINT)
+    )
+    timer.start()
+    t0 = time.monotonic()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _ = worker.env["PATH"]
+        assert time.monotonic() - t0 < 0.7
+    finally:
+        timer.cancel()
+
+    assert busy.rtn == 0
+    assert worker.send("echo survived").out == "survived\n"

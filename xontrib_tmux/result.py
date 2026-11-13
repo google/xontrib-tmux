@@ -378,3 +378,72 @@ class PeerResult(CommandPipeline):
         except InvalidStateError:
             if not self._future.cancelled():
                 raise
+
+
+class LastCmdProxy(CommandPipeline):
+    """Non-blocking proxy for a remote peer's ``__xonsh__.lastcmd``."""
+
+    __hash__ = object.__hash__
+    __eq__ = object.__eq__
+
+    def __init__(self, getter: Callable[[str], Any]) -> None:
+        """Initializes the proxy with a remote attribute getter.
+
+        Args:
+            getter: Callable taking an attribute name (``"args"``, ``"rtn"``,
+                ``"out"``, or ``"err"``) and returning the remote value.
+        """
+        # Intentionally skips CommandPipeline.__init__: values live on peer.
+        self._getter: Callable[[str], Any] = getter
+
+    @blocking_property
+    def args(self) -> list[str] | None:
+        """Argument list of the last command, or ``None`` if none has run."""
+        return self._getter("args")
+
+    @blocking_property
+    def rtn(self) -> int | None:
+        """Exit status of the last command, or ``None`` if none has run."""
+        return self._getter("rtn")
+
+    @blocking_property
+    def out(self) -> str | None:
+        """Recorded stdout of the last command, or ``None`` if unavailable."""
+        return self._getter("out")
+
+    @blocking_property
+    def err(self) -> str | None:
+        """Recorded stderr of the last command, or ``None`` if unavailable."""
+        return self._getter("err")
+
+    def __bool__(self) -> bool:
+        """Returns ``True`` iff the last command exited with status 0."""
+        return self.rtn == 0
+
+    def __len__(self) -> int:
+        """Raises ``TypeError`` because ``LastCmdProxy`` has no length."""
+        raise TypeError("object of type 'LastCmdProxy' has no len()")
+
+    def __iter__(self) -> Iterator[str]:
+        """Iterates over recorded stdout lines (empty if unavailable)."""
+        out = self.out
+        return iter(out.splitlines() if out is not None else [])
+
+    def __int__(self) -> int:
+        """Returns ``int(self.rtn)`` or raises ``TypeError`` when unset."""
+        rtn = self.rtn
+        if rtn is None:
+            raise TypeError("lastcmd has no exit status yet")
+        return int(rtn)
+
+    def __dir__(self) -> list[str]:
+        """Exposes only the four public ``lastcmd`` attribute names."""
+        return ["args", "err", "out", "rtn"]
+
+    def __repr__(self) -> str:
+        """Returns a non-blocking representation of the proxy."""
+        return "<LastCmdProxy>"
+
+    def __str__(self) -> str:
+        """Returns a non-blocking representation of the proxy."""
+        return self.__repr__()

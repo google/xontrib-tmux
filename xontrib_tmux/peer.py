@@ -15,7 +15,7 @@
 """Sender-side ``RemoteXonsh`` peer controller and ``PeerMacro``."""
 
 import atexit
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, MutableMapping
 from concurrent.futures import InvalidStateError
 import fcntl
 import os
@@ -38,18 +38,21 @@ from .protocol import (
     HIDDEN_PEER_ENV,
     PEER_SOCKET_ENV,
     check_block_syntax,
+    decode_value,
     default_timeout,
+    encode_value,
     new_socket_path,
     recv_json,
     send_json,
     verify_peer_uid,
 )
-from .result import CommandRecord, PeerResult
+from .result import CommandRecord, LastCmdProxy, PeerFuture, PeerResult
 
 
 _DEFAULT_ROWS = 24
 _DEFAULT_COLS = 80
 _POLL_INTERVAL_S = 0.02
+_SELF_WAIT_ERROR = "Cannot wait on this shell's own peer from the main thread"
 
 _SyntaxWorkItem = tuple[str, threading.Event, list[Any]]
 _syntax_worker_lock = threading.Lock()
@@ -395,9 +398,29 @@ def _decode_error_response(resp: dict[str, Any]) -> BaseException:
         return SyntaxError(err_msg)
     if err_type == "ValueError":
         return ValueError(err_msg)
+    if err_type == "KeyError":
+        return KeyError(err_msg)
     if err_type == "TypeError":
         return TypeError(err_msg)
     return RuntimeError(err_msg)
+
+
+def _is_self_main_thread(socket_path: pathlib.Path) -> bool:
+    """Returns True if called on the main thread of the target peer itself."""
+    if threading.current_thread() is not threading.main_thread():
+        return False
+    from . import peer_server
+
+    cur = peer_server.current_peer_socket_path()
+    if not cur:
+        return False
+    return os.path.realpath(socket_path) == os.path.realpath(cur)
+
+
+def _check_not_self_main_thread(socket_path: pathlib.Path) -> None:
+    """Raises ``RuntimeError`` when waiting on oneself from the main thread."""
+    if _is_self_main_thread(socket_path):
+        raise RuntimeError(_SELF_WAIT_ERROR)
 
 
 def _advance_active_ticket(ctrl: _PeerController) -> None:
@@ -421,6 +444,45 @@ def _wait_ticket_turn(ctrl: _PeerController, ticket: int) -> None:
             else:
                 ctrl.abandoned_tickets.add(ticket)
             raise
+
+
+class _BoundPeerResult(PeerResult):
+    """``PeerResult`` enforcing the self-wait guard on the peer main thread."""
+
+    def __init__(
+        self,
+        cancel_hook: Callable[[], bool] | None,
+        self_wait_guard: Callable[[], None],
+    ) -> None:
+        super().__init__(cancel_hook=cancel_hook)
+        self._self_wait_guard = self_wait_guard
+        fut_ref = weakref.ref(self._future)
+
+        def _guarded_result(timeout: float | None = None) -> Any:
+            fut = fut_ref()
+            assert fut is not None
+            if not fut.done():
+                self_wait_guard()
+            return PeerFuture.result(fut, timeout=timeout)
+
+        def _guarded_exception(
+            timeout: float | None = None,
+        ) -> BaseException | None:
+            fut = fut_ref()
+            assert fut is not None
+            if not fut.done():
+                self_wait_guard()
+            return PeerFuture.exception(fut, timeout=timeout)
+
+        self._future.result = _guarded_result  # type: ignore[method-assign]
+        self._future.exception = (  # type: ignore[method-assign]
+            _guarded_exception
+        )
+
+    def _wait(self) -> int:
+        if not self._future.done():
+            self._self_wait_guard()
+        return super()._wait()
 
 
 class _RequestState:
@@ -465,6 +527,55 @@ def _send_cancel_rpc(ctrl: _PeerController, target_id: str) -> bool:
     if resp is None or not resp.get("ok", False):
         return False
     return bool(resp.get("cancelled", False))
+
+
+def _rpc(ctrl: _PeerController, payload: dict[str, Any]) -> dict[str, Any]:
+    """Executes a synchronous FIFO-ordered JSON RPC against the peer."""
+    _check_not_self_main_thread(ctrl.socket_path)
+    with ctrl.lock:
+        if ctrl.state.killed:
+            raise RuntimeError("Peer has been killed")
+        ticket = ctrl.next_ticket
+        ctrl.next_ticket += 1
+
+    sock: socket.socket | None = None
+    try:
+        _wait_ticket_turn(ctrl, ticket)
+        try:
+            if ctrl.state.killed:
+                raise RuntimeError("Peer has been killed")
+            sock = _wait_until_ready(ctrl)
+            with ctrl.lock:
+                if ctrl.state.killed:
+                    sock.close()
+                    sock = None
+                    raise RuntimeError("Peer has been killed")
+                ctrl.active_sockets.add(sock)
+            send_json(sock, payload)
+        finally:
+            with ctrl.send_cond:
+                _advance_active_ticket(ctrl)
+
+        with sock.makefile("r", encoding="utf-8") as stream:
+            resp = recv_json(stream)
+        if resp is None:
+            msg = (
+                "Peer exited"
+                if ctrl.state.killed
+                else "Peer disconnected before completing request"
+            )
+            raise RuntimeError(msg)
+        if not resp.get("ok", False):
+            raise _decode_error_response(resp)
+        return resp
+    finally:
+        if sock is not None:
+            with ctrl.lock:
+                ctrl.active_sockets.discard(sock)
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 def _request_worker(
@@ -583,6 +694,87 @@ def _request_worker(
                 pass
 
 
+class _MappingProxy(MutableMapping[str, Any]):
+    """Live ``MutableMapping`` stand-in for a peer's ``env`` or ``ctx``."""
+
+    def __init__(self, peer: "RemoteXonsh", prefix: str) -> None:
+        self._peer = peer
+        self._prefix = prefix
+
+    def __getitem__(self, key: str) -> Any:
+        resp = _rpc(
+            self._peer._ctrl,
+            {"id": uuid.uuid4().hex, "op": f"{self._prefix}_get", "key": key},
+        )
+        return decode_value(resp["value"])
+
+    def __setitem__(self, key: str, value: Any) -> None:
+        # Pickle on the caller thread so unpicklable values raise immediately.
+        encoded = encode_value(value)
+        _rpc(
+            self._peer._ctrl,
+            {
+                "id": uuid.uuid4().hex,
+                "op": f"{self._prefix}_set",
+                "key": key,
+                "value": encoded,
+            },
+        )
+
+    def __delitem__(self, key: str) -> None:
+        _rpc(
+            self._peer._ctrl,
+            {"id": uuid.uuid4().hex, "op": f"{self._prefix}_del", "key": key},
+        )
+
+    def __contains__(self, key: object) -> bool:
+        _check_not_self_main_thread(self._peer._socket_path)
+        if not isinstance(key, str):
+            return False
+        resp = _rpc(
+            self._peer._ctrl,
+            {
+                "id": uuid.uuid4().hex,
+                "op": f"{self._prefix}_contains",
+                "key": key,
+            },
+        )
+        return bool(resp.get("contains", False))
+
+    def __iter__(self) -> Iterator[str]:
+        resp = _rpc(
+            self._peer._ctrl,
+            {"id": uuid.uuid4().hex, "op": f"{self._prefix}_keys"},
+        )
+        return iter(list(resp.get("keys", [])))
+
+    def __len__(self) -> int:
+        resp = _rpc(
+            self._peer._ctrl,
+            {"id": uuid.uuid4().hex, "op": f"{self._prefix}_keys"},
+        )
+        return len(resp.get("keys", []))
+
+    def __repr__(self) -> str:
+        return (
+            f"<{type(self).__name__} socket={self._peer._socket_path.name}>"
+        )
+
+
+class EnvProxy(_MappingProxy):
+    """Live ``MutableMapping`` stand-in for a peer's ``__xonsh__.env``."""
+
+    def __init__(self, peer: "RemoteXonsh") -> None:
+        super().__init__(peer, prefix="env")
+
+
+class CtxProxy(_MappingProxy):
+    """Live ``MutableMapping`` stand-in for a peer's ``__xonsh__.ctx``."""
+
+    def __init__(self, peer: "RemoteXonsh") -> None:
+        super().__init__(peer, prefix="ctx")
+
+
 class PeerMacro:
     """Context manager macro for sending ``with!`` blocks to ``RemoteXonsh``."""
 
@@ -698,6 +890,29 @@ class RemoteXonsh:
         self._ctrl = ctrl
         self._socket_path = socket_path
 
+    @property
+    def env(self) -> EnvProxy:
+        """Returns a live ``MutableMapping`` view of the peer's ``env``."""
+        return EnvProxy(self)
+
+    @property
+    def ctx(self) -> CtxProxy:
+        """Returns a live ``MutableMapping`` view of the peer's ``ctx``."""
+        return CtxProxy(self)
+
+    @property
+    def lastcmd(self) -> LastCmdProxy:
+        """Returns a non-blocking proxy for the peer's ``lastcmd``."""
+        return LastCmdProxy(self._get_lastcmd_attr)
+
+    def _get_lastcmd_attr(self, attr: str) -> Any:
+        """Fetches one attribute from the peer's ``__xonsh__.lastcmd``."""
+        resp = _rpc(
+            self._ctrl,
+            {"id": uuid.uuid4().hex, "op": "lastcmd_get"},
+        )
+        return resp.get(attr)
+
     def send(
         self,
         block: str | None = None,
@@ -729,6 +944,7 @@ class RemoteXonsh:
             raise RuntimeError("Peer has been killed")
         normalized = _check_syntax_detached(block)
         ctrl = self._ctrl
+        sock_path = self._socket_path
         req_id = uuid.uuid4().hex
         req_state = _RequestState()
         ctrl_ref = weakref.ref(ctrl)
@@ -750,7 +966,10 @@ class RemoteXonsh:
                     return True
             return _send_cancel_rpc(c, req_id)
 
-        result = PeerResult(cancel_hook=_cancel_hook)
+        result = _BoundPeerResult(
+            cancel_hook=_cancel_hook,
+            self_wait_guard=lambda: _check_not_self_main_thread(sock_path),
+        )
         # Keep hidden peer alive while this result is pending; cleared by
         # _request_worker's finally block (avoiding a done-callback cycle).
         result._peer_ctrl = ctrl  # type: ignore[attr-defined]

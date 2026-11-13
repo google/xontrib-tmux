@@ -15,7 +15,7 @@
 """Hermetic unit tests for ``xontrib_tmux.peer`` and ``RemoteXonsh``."""
 
 import ast
-from collections.abc import Callable
+from collections.abc import Callable, MutableMapping
 from concurrent.futures import CancelledError
 import gc
 import os
@@ -32,6 +32,8 @@ from xonsh.completers.python import attr_complete
 
 from xontrib_tmux import _load_xontrib_, _unload_xontrib_
 from xontrib_tmux.peer import (
+    CtxProxy,
+    EnvProxy,
     PeerMacro,
     RemoteXonsh,
     _PeerController,
@@ -41,9 +43,12 @@ from xontrib_tmux.peer import (
 from xontrib_tmux.protocol import (
     HIDDEN_PEER_ENV,
     PEER_SOCKET_ENV,
+    decode_value,
+    encode_value,
     recv_json,
     send_json,
 )
+from xontrib_tmux.result import LastCmdProxy
 
 
 class _MockPeerServer:
@@ -912,4 +917,282 @@ def test_future_cancel_local_and_peer_arbitrated(
             _ = queued.rtn
     finally:
         allow_finish.set()
+        srv.close()
+
+
+def test_env_and_ctx_proxies_and_lastcmd_round_trip(
+    tmp_path: pathlib.Path, xonsh_execer: Any
+) -> None:
+    del xonsh_execer
+    sock = _short_sock(tmp_path, "proxies.sock")
+    env_store: dict[str, Any] = {"PATH": ["/usr/bin"]}
+    ctx_store: dict[str, Any] = {"existing": 42}
+    lastcmd_data: dict[str, Any] = {
+        "args": None,
+        "rtn": None,
+        "out": None,
+        "err": None,
+    }
+    ops_seen: list[str] = []
+
+    def handler(conn: socket.socket, req: dict[str, Any]) -> None:
+        op = req["op"]
+        ops_seen.append(op)
+        rid = req["id"]
+        if op.startswith("env_") or op.startswith("ctx_"):
+            prefix, action = op.split("_", 1)
+            store = env_store if prefix == "env" else ctx_store
+            if action == "get":
+                key = req["key"]
+                if key not in store:
+                    send_json(
+                        conn,
+                        {
+                            "id": rid,
+                            "ok": False,
+                            "error_type": "KeyError",
+                            "error": repr(key),
+                        },
+                    )
+                else:
+                    send_json(
+                        conn,
+                        {
+                            "id": rid,
+                            "ok": True,
+                            "value": encode_value(store[key]),
+                        },
+                    )
+            elif action == "set":
+                store[req["key"]] = decode_value(req["value"])
+                send_json(conn, {"id": rid, "ok": True})
+            elif action == "del":
+                key = req["key"]
+                if key not in store:
+                    send_json(
+                        conn,
+                        {
+                            "id": rid,
+                            "ok": False,
+                            "error_type": "KeyError",
+                            "error": repr(key),
+                        },
+                    )
+                else:
+                    del store[key]
+                    send_json(conn, {"id": rid, "ok": True})
+            elif action == "contains":
+                send_json(
+                    conn,
+                    {"id": rid, "ok": True, "contains": req["key"] in store},
+                )
+            elif action == "keys":
+                send_json(
+                    conn,
+                    {"id": rid, "ok": True, "keys": list(store.keys())},
+                )
+        elif op == "lastcmd_get":
+            send_json(conn, {"id": rid, "ok": True, **lastcmd_data})
+
+    srv = _MockPeerServer(sock, handler).start()
+    try:
+        peer = _peer_from_socket(sock, time.monotonic())
+        t0 = time.monotonic()
+        assert isinstance(peer.env, EnvProxy)
+        assert isinstance(peer.env, MutableMapping)
+        assert isinstance(peer.ctx, CtxProxy)
+        assert isinstance(peer.ctx, MutableMapping)
+        assert "EnvProxy" in repr(peer.env)
+        assert "CtxProxy" in repr(peer.ctx)
+        assert repr(peer.lastcmd) == "<LastCmdProxy>"
+        c_worker = attr_complete(
+            "worker.", {"worker": peer}, lambda o, a: o.startswith(a)
+        )
+        c_last = attr_complete(
+            "worker.lastcmd.", {"worker": peer}, lambda o, a: o.startswith(a)
+        )
+        assert time.monotonic() - t0 < 0.05
+        assert ops_seen == []
+        assert {"worker.env[", "worker.ctx[", "worker.lastcmd"} <= set(
+            c_worker
+        )
+        assert {
+            "worker.lastcmd.args",
+            "worker.lastcmd.rtn",
+            "worker.lastcmd.out",
+            "worker.lastcmd.err",
+        } <= set(c_last)
+
+        # Unpicklable values must fail locally without hitting the socket.
+        unpicklable = (i for i in range(2))
+        with pytest.raises(TypeError):
+            peer.env["BAD"] = unpicklable
+        with pytest.raises(TypeError):
+            peer.ctx["BAD"] = (i for i in range(2))
+        assert ops_seen == []
+
+        # env CRUD + copy semantics.
+        assert "PATH" in peer.env
+        assert 123 not in peer.env  # type: ignore[operator]
+        path_copy = peer.env["PATH"]
+        path_copy.append("/extra")
+        assert peer.env["PATH"] == ["/usr/bin"]
+        peer.env["CC"] = "clang"
+        assert env_store["CC"] == "clang"
+        assert peer.env.get("MISSING", "fallback") == "fallback"
+        assert sorted(peer.env) == ["CC", "PATH"]
+        assert len(peer.env) == 2
+        del peer.env["CC"]
+        assert "CC" not in peer.env
+        with pytest.raises(KeyError):
+            _ = peer.env["CC"]
+        with pytest.raises(KeyError):
+            del peer.env["CC"]
+
+        # ctx CRUD.
+        assert peer.ctx["existing"] == 42
+        peer.ctx["target"] = {"mode": "release"}
+        assert list(peer.ctx) == ["existing", "target"]
+        del peer.ctx["existing"]
+        assert len(peer.ctx) == 1
+
+        # lastcmd before and after a command.
+        assert peer.lastcmd.args is None
+        assert peer.lastcmd.rtn is None
+        assert peer.lastcmd.out is None
+        assert peer.lastcmd.err is None
+        lastcmd_data.update(
+            {"args": ["echo", "clang"], "rtn": 0, "out": "clang\n", "err": ""}
+        )
+        assert peer.lastcmd.args == ["echo", "clang"]
+        assert peer.lastcmd.rtn == 0
+        assert peer.lastcmd.out == "clang\n"
+        assert peer.lastcmd.err == ""
+    finally:
+        srv.close()
+
+
+def test_self_send_and_self_wait_guard(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+) -> None:
+    import xontrib_tmux.peer_server as peer_server_mod
+
+    sock = _short_sock(tmp_path, "self.sock")
+    link_sock = _short_sock(tmp_path, "self_link.sock")
+    os.symlink(sock, link_sock)
+
+    def handler(conn: socket.socket, req: dict[str, Any]) -> None:
+        if req["op"] == "run":
+            send_json(
+                conn,
+                {
+                    "id": req["id"],
+                    "ok": True,
+                    "rtn": 0,
+                    "commands": [
+                        {
+                            "args": ["echo", "hi"],
+                            "rtn": 0,
+                            "out": "hi\n",
+                            "err": "",
+                        }
+                    ],
+                },
+            )
+        elif req["op"] == "env_get":
+            send_json(
+                conn,
+                {"id": req["id"], "ok": True, "value": encode_value("val")},
+            )
+        elif req["op"] == "lastcmd_get":
+            send_json(
+                conn,
+                {
+                    "id": req["id"],
+                    "ok": True,
+                    "args": ["echo"],
+                    "rtn": 0,
+                    "out": "hi\n",
+                    "err": "",
+                },
+            )
+
+    srv = _MockPeerServer(sock, handler).start()
+    try:
+        monkeypatch.setattr(
+            peer_server_mod, "current_peer_socket_path", lambda: str(sock)
+        )
+        # Connect via symlink to verify realpath comparison.
+        self_peer = _peer_from_socket(link_sock, time.monotonic())
+
+        # Sending from main thread inside peer is allowed and queued.
+        hold_res = self_peer.send("echo hi")
+        # Keep a pending result using a starting/unready self socket to test
+        # _wait() self-wait guard across waiting members.
+        unbound_sock = _short_sock(tmp_path, "self_unbound.sock")
+        monkeypatch.setattr(
+            peer_server_mod,
+            "current_peer_socket_path",
+            lambda: str(unbound_sock),
+        )
+        unready_ctrl = _PeerController(
+            socket_path=unbound_sock,
+            start_time=time.monotonic(),
+            is_hidden=False,
+            is_alive=lambda: True,
+        )
+        blocked_peer = _peer_from_ctrl(unready_ctrl)
+        pending = blocked_peer._submit_block("echo later")
+        try:
+            with pytest.raises(RuntimeError, match="own peer"):
+                _ = pending.rtn
+            with pytest.raises(RuntimeError, match="own peer"):
+                _ = pending.out
+            with pytest.raises(RuntimeError, match="own peer"):
+                pending.end()
+            with pytest.raises(RuntimeError, match="own peer"):
+                _ = bool(pending)
+            with pytest.raises(RuntimeError, match="own peer"):
+                _ = pending.future.result()
+            with pytest.raises(RuntimeError, match="own peer"):
+                _ = pending.future.exception()
+        finally:
+            blocked_peer.kill()
+            try:
+                _ = pending.future.result(timeout=1.0)
+            except RuntimeError:
+                pass
+
+        monkeypatch.setattr(
+            peer_server_mod, "current_peer_socket_path", lambda: str(sock)
+        )
+
+        # env/ctx/lastcmd RPCs on self main thread always raise immediately.
+        with pytest.raises(RuntimeError, match="own peer"):
+            _ = self_peer.env["A"]
+        with pytest.raises(RuntimeError, match="own peer"):
+            self_peer.env["A"] = "1"
+        with pytest.raises(RuntimeError, match="own peer"):
+            _ = "A" in self_peer.ctx
+        with pytest.raises(RuntimeError, match="own peer"):
+            _ = self_peer.lastcmd.rtn
+
+        # Background thread is allowed to wait on self_peer.
+        bg_results: list[Any] = []
+
+        def _bg() -> None:
+            bg_results.append(self_peer.send("echo hi").out)
+            bg_results.append(self_peer.env["A"])
+            bg_results.append(self_peer.lastcmd.rtn)
+            _ = hold_res.future.result(timeout=2.0)
+
+        t = threading.Thread(target=_bg)
+        t.start()
+        t.join(timeout=3.0)
+        assert not t.is_alive()
+        assert bg_results == ["hi\n", "val", 0]
+
+        # Once hold_res is already finished, reading on main thread works.
+        assert hold_res.out == "hi\n"
+    finally:
         srv.close()

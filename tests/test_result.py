@@ -28,6 +28,7 @@ from xonsh.procs.pipelines import CommandPipeline, blocking_property
 
 from xontrib_tmux.result import (
     CommandRecord,
+    LastCmdProxy,
     PeerFuture,
     PeerResult,
 )
@@ -501,3 +502,75 @@ def test_cancelled_result_raises_on_all_waiters_and_silent_gc(
     del unread
     gc.collect()
     assert capsys.readouterr().err == ""
+
+
+def test_last_cmd_proxy_and_nonblocking_tab_completion(
+    xonsh_execer: Any,
+) -> None:
+    del xonsh_execer
+    calls: list[str] = []
+    values: dict[str, Any] = {
+        "args": ["echo", "clang"],
+        "rtn": 0,
+        "out": "clang\n",
+        "err": "",
+    }
+
+    def getter(attr: str) -> Any:
+        calls.append(attr)
+        return values[attr]
+
+    proxy = LastCmdProxy(getter)
+    assert isinstance(proxy, CommandPipeline)
+    assert dir(proxy) == ["args", "err", "out", "rtn"]
+    assert repr(proxy) == "<LastCmdProxy>"
+    assert str(proxy) == "<LastCmdProxy>"
+
+    t0 = time.monotonic()
+    comps = attr_complete(
+        "worker.lastcmd.",
+        {"worker": type("W", (), {"lastcmd": proxy})()},
+        lambda o, a: o.startswith(a),
+    )
+    assert time.monotonic() - t0 < 0.05
+    assert calls == []
+    assert {
+        "worker.lastcmd.args",
+        "worker.lastcmd.rtn",
+        "worker.lastcmd.out",
+        "worker.lastcmd.err",
+    } <= set(comps)
+
+    # Non-blocking equality/hashing and explicit len/bool/iter/int dunders.
+    other_proxy = LastCmdProxy(getter)
+    assert {proxy, other_proxy} == {proxy, other_proxy}
+    assert (proxy == proxy) is True
+    assert (proxy == other_proxy) is False
+    assert (proxy == None) is False  # noqa: E711
+    assert calls == []
+    with pytest.raises(TypeError):
+        _ = len(proxy)
+    assert calls == []
+
+    assert proxy.args == ["echo", "clang"]
+    assert proxy.rtn == 0
+    assert proxy.out == "clang\n"
+    assert proxy.err == ""
+    assert bool(proxy) is True
+    assert list(proxy) == ["clang"]
+    assert int(proxy) == 0
+    assert calls == ["args", "rtn", "out", "err", "rtn", "out", "rtn"]
+
+    values["rtn"] = 2
+    assert bool(proxy) is False
+    assert int(proxy) == 2
+
+    empty_proxy = LastCmdProxy(lambda _attr: None)
+    assert empty_proxy.args is None
+    assert empty_proxy.rtn is None
+    assert empty_proxy.out is None
+    assert empty_proxy.err is None
+    assert bool(empty_proxy) is False
+    assert list(empty_proxy) == []
+    with pytest.raises(TypeError):
+        _ = int(empty_proxy)

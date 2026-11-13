@@ -31,6 +31,8 @@ from . import parser_patch
 from .parser_patch import mark_peer_server_started, write_startup_error
 from .protocol import (
     check_block_syntax,
+    decode_value,
+    encode_value,
     recv_json,
     send_json,
     verify_peer_uid,
@@ -38,6 +40,22 @@ from .protocol import (
 
 
 _NON_PTK_ERROR = "Peer xonsh is not running the prompt_toolkit shell"
+_QUEUED_OPS = frozenset(
+    {
+        "run",
+        "env_get",
+        "env_set",
+        "env_del",
+        "env_contains",
+        "env_keys",
+        "ctx_get",
+        "ctx_set",
+        "ctx_del",
+        "ctx_contains",
+        "ctx_keys",
+        "lastcmd_get",
+    }
+)
 
 _active_server: "_PeerServer | None" = None
 _last_server: "_PeerServer | None" = None
@@ -169,6 +187,12 @@ class _PeerStdTee(io.TextIOBase):
                     cur_buf.stdbuf = getattr(self.std, "buffer", self.std)
                 return
             cur = inner
+
+
+def current_peer_socket_path() -> str | None:
+    """Returns the socket path of the active peer server, if any."""
+    srv = _active_server
+    return srv.socket_path if srv is not None else None
 
 
 def is_hidden_peer() -> bool:
@@ -932,6 +956,15 @@ class _PeerServer:
                         "cancelled": True,
                     },
                 )
+        elif op in _QUEUED_OPS:
+            pending_events[:] = [
+                ev for ev in pending_events if not ev.is_set()
+            ]
+            done_ev = threading.Event()
+            pending_events.append(done_ev)
+            with self._queue_cond:
+                self._queue.append((req, conn, send_lock, done_ev))
+                self._queue_cond.notify()
         else:
             _send_reply(
                 conn,
@@ -1102,6 +1135,10 @@ class _PeerServer:
                 done_ev.set()
                 continue
 
+            if op != "run":
+                self._execute_state_op_when_idle(req, conn, send_lock, done_ev)
+                continue
+
             block = req.get("block")
             record = bool(req.get("record", True))
             try:
@@ -1137,6 +1174,164 @@ class _PeerServer:
                 done_event=done_ev,
             )
             self._submit_when_idle(entry, normalized)
+
+    def _execute_state_op(self, req: dict[str, Any]) -> dict[str, Any]:
+        req_id = req.get("id")
+        op = str(req.get("op", ""))
+        try:
+            if op == "lastcmd_get":
+                cp = getattr(self.xsh, "lastcmd", None)
+                if cp is None:
+                    return {
+                        "id": req_id,
+                        "ok": True,
+                        "args": None,
+                        "rtn": None,
+                        "out": None,
+                        "err": None,
+                    }
+                args = [str(a) for a in (getattr(cp, "args", None) or ())]
+                raw_rtn = getattr(cp, "returncode", None)
+                rtn = int(raw_rtn) if raw_rtn is not None else None
+                spec = getattr(cp, "spec", None)
+                has_cap = spec is not None and (
+                    getattr(spec, "captured_stdout", None) is not None
+                    or getattr(spec, "captured_stderr", None) is not None
+                )
+                if has_cap:
+                    lines = getattr(cp, "lines", None) or ()
+                    out: str | None = "".join(str(line) for line in lines)
+                    raw_err = getattr(cp, "errors", None)
+                    err: str | None = (
+                        raw_err
+                        if isinstance(raw_err, str)
+                        else ("" if raw_err is None else str(raw_err))
+                    )
+                else:
+                    out = None
+                    err = None
+                return {
+                    "id": req_id,
+                    "ok": True,
+                    "args": args,
+                    "rtn": rtn,
+                    "out": out,
+                    "err": err,
+                }
+
+            if op.startswith("env_"):
+                mapping = getattr(self.xsh, "env", None)
+                sub_op = op[4:]
+            elif op.startswith("ctx_"):
+                mapping = getattr(self.xsh, "ctx", None)
+                sub_op = op[4:]
+            else:
+                return {
+                    "id": req_id,
+                    "ok": False,
+                    "error_type": "RuntimeError",
+                    "error": f"Unknown op: {op!r}",
+                }
+
+            if mapping is None:
+                raise RuntimeError(f"Peer {op[:3]} mapping is unavailable")
+
+            key = req.get("key")
+            if sub_op == "get":
+                try:
+                    val = mapping[key]
+                except KeyError:
+                    return {
+                        "id": req_id,
+                        "ok": False,
+                        "error_type": "KeyError",
+                        "error": repr(key),
+                    }
+                return {"id": req_id, "ok": True, "value": encode_value(val)}
+            if sub_op == "set":
+                mapping[key] = decode_value(req["value"])
+                return {"id": req_id, "ok": True}
+            if sub_op == "del":
+                try:
+                    del mapping[key]
+                except KeyError:
+                    return {
+                        "id": req_id,
+                        "ok": False,
+                        "error_type": "KeyError",
+                        "error": repr(key),
+                    }
+                return {"id": req_id, "ok": True}
+            if sub_op == "contains":
+                return {
+                    "id": req_id,
+                    "ok": True,
+                    "contains": bool(key in mapping),
+                }
+            if sub_op == "keys":
+                keys = [k if isinstance(k, str) else str(k) for k in mapping]
+                return {"id": req_id, "ok": True, "keys": keys}
+            return {
+                "id": req_id,
+                "ok": False,
+                "error_type": "RuntimeError",
+                "error": f"Unknown op: {op!r}",
+            }
+        except Exception as exc:
+            return {
+                "id": req_id,
+                "ok": False,
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            }
+
+    def _execute_state_op_when_idle(
+        self,
+        req: dict[str, Any],
+        conn: socket.socket,
+        send_lock: threading.Lock,
+        done_ev: threading.Event,
+    ) -> None:
+        try:
+            while not self._stop_event.is_set():
+                sh = getattr(getattr(self.xsh, "shell", None), "shell", None)
+                app = getattr(getattr(sh, "prompter", None), "app", None)
+                if _is_prompt_idle(sh, app):
+                    loop_done = threading.Event()
+                    state: dict[str, Any] = {"ran": False}
+
+                    def _run_on_loop(
+                        _sh: Any = sh,
+                        _app: Any = app,
+                    ) -> None:
+                        try:
+                            if not _is_prompt_idle(_sh, _app):
+                                return
+                            state["reply"] = self._execute_state_op(req)
+                            state["ran"] = True
+                        finally:
+                            loop_done.set()
+
+                    try:
+                        app.loop.call_soon_threadsafe(_run_on_loop)
+                    except RuntimeError:
+                        loop_done.set()
+                    while not self._stop_event.is_set():
+                        if loop_done.wait(timeout=0.1):
+                            break
+                        is_closed = getattr(app.loop, "is_closed", None)
+                        if callable(is_closed) and is_closed():
+                            break
+                    if self._stop_event.is_set() or not loop_done.is_set():
+                        return
+                    if state.get("ran"):
+                        _send_reply(conn, send_lock, state["reply"])
+                        return
+
+                self._wakeup_event.wait(timeout=0.02)
+                self._wakeup_event.clear()
+        finally:
+            done_ev.set()
 
     def _submit_when_idle(
         self, entry: _PeerEntry, normalized: str

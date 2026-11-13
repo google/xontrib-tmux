@@ -336,3 +336,12 @@ def test_send_and_recv_json() -> None:
     finally:
         s1.close()
         s2.close()
+
+
+def test_encode_decode_value_round_trip() -> None:
+    payload = {"nums": [1, 2, 3], "fn": lambda x: x + 1}
+    encoded = protocol.encode_value(payload)
+    assert isinstance(encoded, str)
+    decoded = protocol.decode_value(encoded)
+    assert decoded["nums"] == [1, 2, 3]
+    assert decoded["fn"](4) == 5
