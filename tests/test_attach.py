@@ -76,6 +76,7 @@ def test_outside_tmux_attach_flags_and_subproc_failure(
 ) -> None:
     """Bare-terminal attach passes server flags and fails on non-zero rc."""
     monkeypatch.setattr(xt_attach, "is_inside_tmux", lambda: False)
+    monkeypatch.delenv("_XONTRIB_TMUX_IS_HIDDEN_ACTIVE", raising=False)
 
     srv = _fake_server(
         socket_name="custom", config_file="/tmp/tmux.conf", colors=256
@@ -125,6 +126,25 @@ def test_outside_tmux_attach_flags_and_subproc_failure(
     mock_xsh = SimpleNamespace(env={}, subproc_uncaptured=fail_subproc)
     monkeypatch.setattr(builtins, "__xonsh__", mock_xsh, raising=False)
     with pytest.raises(libtmux.exc.LibTmuxException, match="exit status 1"):
+        attach(session)
+
+
+def test_outside_tmux_hidden_peer_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Hidden peer shells refuse bare-terminal attach."""
+    from xontrib_tmux import peer_server
+
+    monkeypatch.setattr(xt_attach, "is_inside_tmux", lambda: False)
+    monkeypatch.setenv("_XONTRIB_TMUX_IS_HIDDEN_ACTIVE", "1")
+    session = libtmux.Session(server=_fake_server(), session_id="$1")
+
+    with pytest.raises(libtmux.exc.LibTmuxException, match="hidden peer"):
+        attach(session)
+
+    monkeypatch.delenv("_XONTRIB_TMUX_IS_HIDDEN_ACTIVE", raising=False)
+    monkeypatch.setattr(peer_server, "is_hidden_peer", lambda: True)
+    with pytest.raises(libtmux.exc.LibTmuxException, match="hidden peer"):
         attach(session)
 
 
