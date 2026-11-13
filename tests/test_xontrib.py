@@ -15,11 +15,21 @@
 import builtins
 import shutil
 import subprocess
+from types import SimpleNamespace
 from typing import Any, List
 from unittest.mock import MagicMock
 
 import libtmux  # type: ignore
 import pytest
+
+
+def _stub_default_server() -> SimpleNamespace:
+    return SimpleNamespace(
+        socket_name=None,
+        socket_path=None,
+        config_file=None,
+        colors=None,
+    )
 
 
 def test_it_loads(load_xontrib: Any) -> None:
@@ -41,7 +51,7 @@ def test_pane_has_text_monkeypatch(load_xontrib: Any) -> None:
 
 def test_attach_xonsh_subproc(load_xontrib: Any, monkeypatch: Any) -> None:
     load_xontrib("tmux")
-    session = libtmux.Session(server=libtmux.Server(), session_id="$42")
+    session = libtmux.Session(server=_stub_default_server(), session_id="$42")
 
     recorded_cmds: List[Any] = []
 
@@ -58,12 +68,14 @@ def test_attach_xonsh_subproc(load_xontrib: Any, monkeypatch: Any) -> None:
 
 def test_attach_outside_xonsh(load_xontrib: Any, monkeypatch: Any) -> None:
     load_xontrib("tmux")
-    session = libtmux.Session(server=libtmux.Server(), session_id="$99")
+    session = libtmux.Session(server=_stub_default_server(), session_id="$99")
 
     recorded_cmds: List[Any] = []
 
     monkeypatch.delattr(builtins, "__xonsh__", raising=False)
-    monkeypatch.setattr(subprocess, "run", lambda cmd: recorded_cmds.append(cmd))
+    monkeypatch.setattr(
+        subprocess, "run", lambda cmd: recorded_cmds.append(cmd)
+    )
 
     result = session.attach()
     assert result is session
@@ -122,7 +134,7 @@ def test_attach_server_socket_path(load_xontrib: Any, monkeypatch: Any) -> None:
 
 def test_attach_missing_session_id(load_xontrib: Any) -> None:
     load_xontrib("tmux")
-    session = libtmux.Session(server=libtmux.Server())
+    session = libtmux.Session(server=_stub_default_server())
     session.session_id = None
     session.session_name = None
 

@@ -49,6 +49,21 @@ trailing newline):
 - Raises `ValueError` for negative `scrollback`, `TypeError` for non-`bool`/non-`int`,
   and `libtmux.exc.LibTmuxException` if the pane is closed or `capture-pane` fails.
 
+### Attaching and switching sessions
+
+Call `session.attach(...)` on any `libtmux.Session` to view that session:
+
+- Outside tmux (when this shell's controlling terminal is not `$TMUX_PANE`),
+  runs `tmux attach` with server options (`-L`, `-S`, `-f`, `-2`/`-8`) and
+  optional `exit_` (`-x`) or `flags_`. Raises `libtmux.exc.LibTmuxException` on
+  non-zero exit.
+- Already inside tmux (detected by comparing the process's controlling terminal
+  against `$TMUX_PANE`'s `pane_tty`), automatically switches an active client on
+  the caller's tmux server using `tmux switch-client` (preferring the most
+  recently active client on the caller's session). Passing `exit_`, `flags_`, or
+  positional args inside tmux raises `ValueError`, and switching to a session
+  on a different tmux server raises `xontrib_tmux.attach.DifferentTmuxServerError`.
+
 ## Development
 
 - activate [pre-commit](https://github.com/pre-commit/pre-commit) hooks

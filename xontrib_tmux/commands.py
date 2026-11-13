@@ -14,10 +14,63 @@
 
 """Helper functions for interacting with tmux from xonsh."""
 
+import os
 import shutil
 from typing import Optional
 
 import libtmux  # type: ignore
+
+
+def _controlling_tty_rdev() -> int:
+    """Returns the device number of this process's controlling terminal.
+
+    Reads field 7 (``tty_nr``) after the closing ``)`` of ``comm`` in
+    ``/proc/self/stat``, falling back to ``os.ttyname`` on stdio descriptors.
+    Returns ``0`` when the process has no controlling terminal.
+    """
+    try:
+        with open(
+            "/proc/self/stat", "r", encoding="ascii", errors="replace"
+        ) as f:
+            raw = f.read()
+        idx = raw.rfind(")")
+        if idx != -1:
+            fields = raw[idx + 1 :].split()
+            if len(fields) >= 5:
+                return int(fields[4])
+    except (OSError, ValueError, IndexError):
+        pass
+
+    for fd in (0, 1, 2):
+        try:
+            tty = os.ttyname(fd)
+            return os.stat(tty).st_rdev
+        except OSError:
+            continue
+    return 0
+
+
+def is_inside_tmux() -> bool:
+    """Returns True only when this process's controlling tty is $TMUX_PANE."""
+    if not os.environ.get("TMUX") or not os.environ.get("TMUX_PANE"):
+        return False
+    rdev = _controlling_tty_rdev()
+    if rdev == 0:
+        return False
+    pane_id = os.environ["TMUX_PANE"]
+    try:
+        server = libtmux.Server.from_env()
+        res = server.cmd(
+            "display-message", "-p", "-t", pane_id, "#{pane_tty}"
+        )
+        if res.stderr or not res.stdout:
+            return False
+        pane_tty = res.stdout[0].strip()
+        if not pane_tty:
+            return False
+        return os.stat(pane_tty).st_rdev == rdev
+    except (OSError, libtmux.exc.LibTmuxException, ValueError):
+        return False
 
 
 def _which_xonsh() -> str:
@@ -71,24 +124,30 @@ def tmuxp(*args, **kwargs) -> libtmux.Pane:
 
 
 def curtmuxs() -> Optional[libtmux.Session]:
-    """Returns the current tmux session from environment if available."""
+    """Returns the current tmux session when inside tmux, else None."""
+    if not is_inside_tmux():
+        return None
     try:
         return libtmux.Session.from_env()
-    except libtmux.exc.NotInsideTmux:
+    except libtmux.exc.LibTmuxException:
         return None
 
 
 def curtmuxw() -> Optional[libtmux.Window]:
-    """Returns the current tmux window from environment if available."""
+    """Returns the current tmux window when inside tmux, else None."""
+    if not is_inside_tmux():
+        return None
     try:
         return libtmux.Window.from_env()
-    except libtmux.exc.NotInsideTmux:
+    except libtmux.exc.LibTmuxException:
         return None
 
 
 def curtmuxp() -> Optional[libtmux.Pane]:
-    """Returns the current tmux pane from environment if available."""
+    """Returns the current tmux pane when inside tmux, else None."""
+    if not is_inside_tmux():
+        return None
     try:
         return libtmux.Pane.from_env()
-    except libtmux.exc.NotInsideTmux:
+    except libtmux.exc.LibTmuxException:
         return None
