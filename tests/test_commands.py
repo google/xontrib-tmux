@@ -21,6 +21,7 @@ import shlex
 import signal
 import socket
 import sys
+import tempfile
 import time
 from types import SimpleNamespace
 from typing import Any
@@ -421,110 +422,113 @@ def test_xwin_and_xpane_command_construction(
 
 
 def test_get_pane_xonsh_lifecycle_and_caching(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: pathlib.Path
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Tests starting, listening, caching, kill-reconnect, and dead cleanup."""
     _reset_pane_cache()
     try:
-        sock_path = tmp_path / "peer_a.sock"
-        err_path = pathlib.Path(f"{sock_path}.err")
-        option_val = f"{sock_path}|{time.time()}|424242"
+        with tempfile.TemporaryDirectory(dir="/tmp", prefix="xt_cmd_") as td:
+            sock_path = pathlib.Path(td) / "peer_a.sock"
+            err_path = pathlib.Path(f"{sock_path}.err")
+            option_val = f"{sock_path}|{time.time()}|424242"
 
-        class _FakePane:
-            def __init__(self) -> None:
-                self.pane_id = "%11"
-                self.server = SimpleNamespace(
-                    socket_path="/tmp/tmux-1000/test", socket_name=None
-                )
-                self.option: str | None = option_val
-                self.unset_calls = 0
-
-            def cmd(self, cmd: str, *args: Any, **kwargs: Any) -> Any:
-                if cmd == "display-message":
-                    val = self.option or ""
-                    return SimpleNamespace(
-                        stderr=[], stdout=[f"{val}\t424242"]
+            class _FakePane:
+                def __init__(self) -> None:
+                    self.pane_id = "%11"
+                    self.server = SimpleNamespace(
+                        socket_path="/tmp/tmux-1000/test", socket_name=None
                     )
-                if cmd == "set-option" and "-u" in args:
-                    self.unset_calls += 1
-                    self.option = None
-                    return SimpleNamespace(stderr=[], stdout=[])
-                raise AssertionError(f"Unexpected cmd: {cmd} {args}")
+                    self.option: str | None = option_val
+                    self.unset_calls = 0
 
-        pane = _FakePane()
+                def cmd(self, cmd: str, *args: Any, **kwargs: Any) -> Any:
+                    if cmd == "display-message":
+                        val = self.option or ""
+                        return SimpleNamespace(
+                            stderr=[], stdout=[f"{val}\t424242"]
+                        )
+                    if cmd == "set-option" and "-u" in args:
+                        self.unset_calls += 1
+                        self.option = None
+                        return SimpleNamespace(stderr=[], stdout=[])
+                    raise AssertionError(f"Unexpected cmd: {cmd} {args}")
 
-        # 1. Empty option -> None.
-        pane.option = ""
-        assert commands.get_pane_xonsh(pane) is None
+            pane = _FakePane()
 
-        # 2. Starting (no socket file yet, within timeout, pid alive) -> cached.
-        pane.option = option_val
-        alive_flag = True
+            # 1. Empty option -> None.
+            pane.option = ""
+            assert commands.get_pane_xonsh(pane) is None
 
-        def fake_kill(pid: int, sig: int) -> None:
-            if sig == 0:
-                if not alive_flag:
-                    raise ProcessLookupError
-                return
-            killed_signals.append((pid, sig))
+            # 2. Starting (no socket file yet, within timeout, pid alive) -> cached.
+            pane.option = option_val
+            alive_flag = True
 
-        killed_signals: list[tuple[int, int]] = []
-        monkeypatch.setattr(os, "kill", fake_kill)
-        monkeypatch.setattr(
-            os, "killpg", lambda pgid, sig: killed_signals.append((pgid, sig))
-        )
+            def fake_kill(pid: int, sig: int) -> None:
+                if sig == 0:
+                    if not alive_flag:
+                        raise ProcessLookupError
+                    return
+                killed_signals.append((pid, sig))
 
-        rx1 = commands.get_pane_xonsh(pane)
-        assert isinstance(rx1, RemoteXonsh)
-        rx2 = commands.get_pane_xonsh(pane)
-        assert rx2 is rx1
+            killed_signals: list[tuple[int, int]] = []
+            monkeypatch.setattr(os, "kill", fake_kill)
+            monkeypatch.setattr(
+                os,
+                "killpg",
+                lambda pgid, sig: killed_signals.append((pgid, sig)),
+            )
 
-        # 3. Real listening socket: kill() when still alive causes reconnect.
-        srv_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        srv_sock.bind(str(sock_path))
-        srv_sock.listen(1)
-        try:
-            rx1.kill()
-            assert (424242, signal.SIGKILL) in killed_signals
-            # Re-bind socket to simulate process still alive after handle kill.
-            srv_sock.close()
+            rx1 = commands.get_pane_xonsh(pane)
+            assert isinstance(rx1, RemoteXonsh)
+            rx2 = commands.get_pane_xonsh(pane)
+            assert rx2 is rx1
+
+            # 3. Real listening socket: kill() when still alive causes reconnect.
             srv_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             srv_sock.bind(str(sock_path))
             srv_sock.listen(1)
+            try:
+                rx1.kill()
+                assert (424242, signal.SIGKILL) in killed_signals
+                # Re-bind socket to simulate process still alive after handle kill.
+                srv_sock.close()
+                srv_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                srv_sock.bind(str(sock_path))
+                srv_sock.listen(1)
 
-            rx3 = commands.get_pane_xonsh(pane)
-            assert rx3 is not None
-            assert rx3 is not rx1
-        finally:
-            srv_sock.close()
+                rx3 = commands.get_pane_xonsh(pane)
+                assert rx3 is not None
+                assert rx3 is not rx1
+            finally:
+                srv_sock.close()
 
-        # 4. ConnectionRefusedError on existing socket -> cleanup + None.
-        assert sock_path.exists()
-        assert commands.get_pane_xonsh(pane) is None
-        assert not sock_path.exists()
-        assert pane.unset_calls == 1
+            # 4. ConnectionRefusedError on existing socket -> cleanup + None.
+            assert sock_path.exists()
+            assert commands.get_pane_xonsh(pane) is None
+            assert not sock_path.exists()
+            assert pane.unset_calls == 1
 
-        # 5. .err sentinel present -> cleanup + None.
-        pane.option = option_val
-        sock_path.write_text("", encoding="utf-8")
-        err_path.write_text("failed boot", encoding="utf-8")
-        assert commands.get_pane_xonsh(pane) is None
-        assert not sock_path.exists()
-        assert not err_path.exists()
-        assert pane.unset_calls == 2
+            # 5. .err sentinel present -> cleanup + None.
+            pane.option = option_val
+            sock_path.write_text("", encoding="utf-8")
+            err_path.write_text("failed boot", encoding="utf-8")
+            assert commands.get_pane_xonsh(pane) is None
+            assert not sock_path.exists()
+            assert not err_path.exists()
+            assert pane.unset_calls == 2
 
-        # 6. ProcessLookupError (dead PID) -> cleanup + None.
-        pane.option = option_val
-        alive_flag = False
-        sock_path.write_text("", encoding="utf-8")
-        assert commands.get_pane_xonsh(pane) is None
-        assert not sock_path.exists()
-        assert pane.unset_calls == 3
+            # 6. ProcessLookupError (dead PID) -> cleanup + None.
+            pane.option = option_val
+            alive_flag = False
+            sock_path.write_text("", encoding="utf-8")
+            assert commands.get_pane_xonsh(pane) is None
+            assert not sock_path.exists()
+            assert pane.unset_calls == 3
 
-        # 7. Start timeout expired without socket -> cleanup + None.
-        alive_flag = True
-        pane.option = f"{sock_path}|1.0|424242"
-        assert commands.get_pane_xonsh(pane) is None
-        assert pane.unset_calls == 4
+            # 7. Start timeout expired without socket -> cleanup + None.
+            alive_flag = True
+            pane.option = f"{sock_path}|1.0|424242"
+            assert commands.get_pane_xonsh(pane) is None
+            assert pane.unset_calls == 4
     finally:
         _reset_pane_cache()

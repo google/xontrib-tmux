@@ -14,6 +14,8 @@
 
 """Target-side Unix socket peer server and prompt queue inside a peer xonsh."""
 
+from __future__ import annotations
+
 import atexit
 import builtins
 import collections
@@ -1661,7 +1663,7 @@ def _bind_peer_socket(socket_path: str) -> socket.socket:
         srv.bind(socket_path)
         if hasattr(os, "getuid"):
             os.chmod(socket_path, 0o600)
-        srv.listen(16)
+        srv.listen(128)
     except Exception:
         srv.close()
         raise

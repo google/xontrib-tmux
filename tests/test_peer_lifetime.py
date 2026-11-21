@@ -40,22 +40,44 @@ def _proc_children(parent_pid: int) -> list[int]:
     """Returns live non-zombie direct child PIDs of ``parent_pid``."""
     target = str(parent_pid)
     children: list[int] = []
-    for entry in os.scandir("/proc"):
-        if not entry.name.isdigit():
+    if os.path.isdir("/proc"):
+        for entry in os.scandir("/proc"):
+            if not entry.name.isdigit():
+                continue
+            try:
+                stat = pathlib.Path(entry.path, "stat").read_text(
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except OSError:
+                continue
+            rparen = stat.rfind(")")
+            if rparen < 0:
+                continue
+            fields = stat[rparen + 2 :].split()
+            if len(fields) >= 2 and fields[1] == target and fields[0] != "Z":
+                children.append(int(entry.name))
+        return sorted(children)
+
+    proc = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,stat="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return []
+    for line in proc.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
             continue
-        try:
-            stat = pathlib.Path(entry.path, "stat").read_text(
-                encoding="utf-8",
-                errors="replace",
-            )
-        except OSError:
-            continue
-        rparen = stat.rfind(")")
-        if rparen < 0:
-            continue
-        fields = stat[rparen + 2 :].split()
-        if len(fields) >= 2 and fields[1] == target and fields[0] != "Z":
-            children.append(int(entry.name))
+        pid_s, ppid_s, state = parts[0], parts[1], parts[2]
+        if (
+            pid_s.isdigit()
+            and ppid_s == target
+            and not state.startswith("Z")
+        ):
+            children.append(int(pid_s))
     return sorted(children)
 
 
@@ -76,24 +98,36 @@ def _proc_tree(root_pid: int) -> list[int]:
 
 def _is_pid_alive(pid: int) -> bool:
     """Returns True if ``pid`` exists and is not a zombie."""
-    try:
-        stat = pathlib.Path(f"/proc/{pid}/stat").read_text(
-            encoding="utf-8",
-            errors="replace",
-        )
-    except FileNotFoundError:
-        return False
-    except OSError:
+    if os.path.isdir("/proc"):
         try:
-            os.kill(pid, 0)
-            return True
-        except ProcessLookupError:
+            stat = pathlib.Path(f"/proc/{pid}/stat").read_text(
+                encoding="utf-8",
+                errors="replace",
+            )
+        except FileNotFoundError:
             return False
-    rparen = stat.rfind(")")
-    if rparen < 0:
-        return True
-    fields = stat[rparen + 2 :].split()
-    return not (fields and fields[0] == "Z")
+        except OSError:
+            try:
+                os.kill(pid, 0)
+                return True
+            except ProcessLookupError:
+                return False
+        rparen = stat.rfind(")")
+        if rparen < 0:
+            return True
+        fields = stat[rparen + 2 :].split()
+        return not (fields and fields[0] == "Z")
+
+    proc = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "stat="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return False
+    state = proc.stdout.strip()
+    return bool(state) and not state.startswith("Z")
 
 
 def _wait_pids_gone(pids: list[int], timeout: float) -> list[int]:
@@ -177,11 +211,19 @@ def _read_pty_until(
 
 def _is_xonsh_peer_pid(pid: int) -> bool:
     """Returns True if ``pid`` is a ``-m xonsh`` peer process."""
-    try:
-        cmdline = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        return False
-    return b"-m\x00xonsh" in cmdline
+    if os.path.isdir("/proc"):
+        try:
+            cmdline = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+        except OSError:
+            return False
+        return b"-m\x00xonsh" in cmdline
+    proc = subprocess.run(
+        ["ps", "-p", str(pid), "-o", "command="],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return proc.returncode == 0 and "-m xonsh" in proc.stdout
 
 
 def _wait_for_new_children(
@@ -348,7 +390,7 @@ def test_parent_normal_exit_cleans_up_peers_and_running_block(
     monkeypatch.delenv("TMUX", raising=False)
     monkeypatch.delenv("TMUX_PANE", raising=False)
     script = (
-        "import os, pathlib, time\n"
+        "import os, pathlib, subprocess, time\n"
         "xontrib load tmux\n"
         "w1 = RemoteXonsh()\n"
         "w2 = RemoteXonsh()\n"
@@ -357,27 +399,40 @@ def test_parent_normal_exit_cleans_up_peers_and_running_block(
         "r2 = w2.send('sleep 30')\n"
         "mypid = str(os.getpid())\n"
         "def _descendant_running():\n"
+        "    if os.path.isdir('/proc'):\n"
+        "        children = set()\n"
+        "        for entry in os.scandir('/proc'):\n"
+        "            if not entry.name.isdigit():\n"
+        "                continue\n"
+        "            try:\n"
+        "                st = pathlib.Path(entry.path, 'stat').read_text()\n"
+        "                f = st[st.rfind(')') + 2:].split()\n"
+        "                if len(f) >= 2 and f[1] == mypid:\n"
+        "                    children.add(entry.name)\n"
+        "            except OSError:\n"
+        "                pass\n"
+        "        for entry in os.scandir('/proc'):\n"
+        "            if not entry.name.isdigit():\n"
+        "                continue\n"
+        "            try:\n"
+        "                st = pathlib.Path(entry.path, 'stat').read_text()\n"
+        "                f = st[st.rfind(')') + 2:].split()\n"
+        "                if len(f) >= 2 and f[1] in children:\n"
+        "                    return True\n"
+        "            except OSError:\n"
+        "                pass\n"
+        "        return False\n"
+        "    res = subprocess.run(\n"
+        "        ['ps', '-axo', 'pid=,ppid='], capture_output=True, text=True\n"
+        "    )\n"
+        "    pairs = [line.split() for line in res.stdout.splitlines()]\n"
         "    children = set()\n"
-        "    for entry in os.scandir('/proc'):\n"
-        "        if not entry.name.isdigit():\n"
-        "            continue\n"
-        "        try:\n"
-        "            st = pathlib.Path(entry.path, 'stat').read_text()\n"
-        "            f = st[st.rfind(')') + 2:].split()\n"
-        "            if len(f) >= 2 and f[1] == mypid:\n"
-        "                children.add(entry.name)\n"
-        "        except OSError:\n"
-        "            pass\n"
-        "    for entry in os.scandir('/proc'):\n"
-        "        if not entry.name.isdigit():\n"
-        "            continue\n"
-        "        try:\n"
-        "            st = pathlib.Path(entry.path, 'stat').read_text()\n"
-        "            f = st[st.rfind(')') + 2:].split()\n"
-        "            if len(f) >= 2 and f[1] in children:\n"
-        "                return True\n"
-        "        except OSError:\n"
-        "            pass\n"
+        "    for p in pairs:\n"
+        "        if len(p) >= 2 and p[1] == mypid:\n"
+        "            children.add(p[0])\n"
+        "    for p in pairs:\n"
+        "        if len(p) >= 2 and p[1] in children:\n"
+        "            return True\n"
         "    return False\n"
         "deadline = time.monotonic() + 8.0\n"
         "while time.monotonic() < deadline and not _descendant_running():\n"
@@ -511,16 +566,18 @@ def test_interactive_prompt_last_underscore_and_exit_cleanup(
             got = _read_pty_until(master_fd, marker, _PTY_PROMPT_TIMEOUT_S)
             assert marker in got, f"Timed out waiting for {marker!r} in {got!r}"
 
-        # Wait for the initial prompt by running a simple echo marker.
+        # Wait for the initial prompt using split marker strings so the pty
+        # input echo does not satisfy the marker before the command runs.
         time.sleep(0.5)
         _send_line(
-            "$PROMPT = '> '; print('__PROMPT_READY__')",
+            "$PROMPT = '> '; print('__PROMPT_' + 'READY__')",
             b"__PROMPT_READY__",
         )
         _send_line(
-            "xontrib load tmux; print('__LOADED__')",
+            "xontrib load tmux; print('__LOAD' + 'ED__')",
             b"__LOADED__",
         )
+        _read_pty_until(master_fd, b"> ", _PTY_PROMPT_TIMEOUT_S)
 
         # Bare RemoteXonsh() is retained by `_` on the interactive prompt.
         baseline = set(_proc_children(proc.pid))
@@ -544,7 +601,7 @@ def test_interactive_prompt_last_underscore_and_exit_cleanup(
         # A still-bound peer on the interactive prompt must exit on shell exit.
         baseline_2 = set(_proc_children(proc.pid))
         _send_line(
-            "w_keep = RemoteXonsh(); print('__BOUND_STARTED__')",
+            "w_keep = RemoteXonsh(); print('__BOUND_' + 'STARTED__')",
             b"__BOUND_STARTED__",
         )
         peers_2 = _wait_for_new_children(

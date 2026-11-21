@@ -341,6 +341,7 @@ def _wait_after_ready(
     ctrl: _PeerController, err_path: pathlib.Path
 ) -> socket.socket:
     """Connects to an already-ready peer, failing immediately if it exited."""
+    refused_retries = 0
     for _ in range(50):
         if ctrl.state.killed:
             raise RuntimeError("Peer exited")
@@ -353,10 +354,20 @@ def _wait_after_ready(
         if sock is not None:
             return sock
         if not transient_busy:
-            err_msg = _read_err_sentinel(err_path)
-            raise RuntimeError(
-                err_msg if err_msg is not None else "Peer exited"
-            )
+            # On macOS/BSD, an AF_UNIX listen-backlog burst can surface as
+            # ECONNREFUSED even while the peer process is alive and listening.
+            if (
+                ctrl.is_alive is not None
+                and ctrl.is_alive()
+                and ctrl.socket_path.exists()
+                and refused_retries < 10
+            ):
+                refused_retries += 1
+            else:
+                err_msg = _read_err_sentinel(err_path)
+                raise RuntimeError(
+                    err_msg if err_msg is not None else "Peer exited"
+                )
         if ctrl.stop_event.wait(0.01):
             raise RuntimeError("Peer exited")
     raise RuntimeError(f"Busy peer socket {ctrl.socket_path}")

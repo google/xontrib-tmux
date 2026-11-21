@@ -496,6 +496,9 @@ def test_scoped_capture_header_in_pane_text_and_history(
     assert pane is not None
     peer = pane.xonsh
     assert peer is not None
+    # Use a short prompt so long CI hostnames do not soft-wrap the header.
+    peer.env["PROMPT"] = "$ "
+    assert pane.send("echo prompt-ready").out == "prompt-ready\n"
 
     peer.ctx["x"] = "before"
     x = 42
@@ -546,7 +549,13 @@ def test_scoped_capture_header_in_pane_text_and_history(
 
     before_int = pane.text(scrollback=True).count("# restored:")
     r_int = pane.send("echo BEFORE_INT\nsleep 3\n", capture=["x"])
-    time.sleep(0.5)
+    deadline = time.monotonic() + 10.0
+    while (
+        "BEFORE_INT" not in pane.text(scrollback=True)
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.05)
+    time.sleep(0.15)
     pane.send_keys("C-c", literal=False)
     assert r_int.rtn != 0
     assert r_int.out == "BEFORE_INT\n"
