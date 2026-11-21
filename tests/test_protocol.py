@@ -344,6 +344,18 @@ def test_verify_peer_uid_so_peercred_and_local_peercred(
     assert protocol.verify_peer_uid(object()) == 0  # type: ignore[arg-type]
 
 
+def test_socket_dir_windows_fallback(
+    tmp_path: pathlib.Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
+    monkeypatch.delattr(os, "getuid", raising=False)
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(tmp_path))
+
+    sdir = protocol.socket_dir()
+    assert sdir == tmp_path / "xontrib-tmux"
+    assert sdir.is_dir()
+
+
 def test_strip_macro_comments() -> None:
     raw = "echo hi #0: comment\n#1: pure comment\nx = 1 #12: end\n"
     assert protocol.strip_macro_comments(raw) == "echo hi\n\nx = 1\n"

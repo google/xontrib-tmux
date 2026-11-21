@@ -14,6 +14,8 @@
 
 """Target-side Unix socket peer server and prompt queue inside a peer xonsh."""
 
+from __future__ import annotations
+
 import atexit
 import builtins
 import collections
@@ -317,9 +319,16 @@ def _send_reply(
 
 def _kill_current_peer() -> None:
     """Terminates the peer process group on a ``kill`` request."""
-    try:
-        os.killpg(os.getpgrp(), signal.SIGKILL)
-    except OSError:
+    if (
+        hasattr(os, "killpg")
+        and hasattr(os, "getpgrp")
+        and hasattr(signal, "SIGKILL")
+    ):
+        try:
+            os.killpg(os.getpgrp(), signal.SIGKILL)
+        except OSError:
+            os._exit(0)
+    else:
         os._exit(0)
 
 
@@ -1652,8 +1661,9 @@ def _bind_peer_socket(socket_path: str) -> socket.socket:
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         srv.bind(socket_path)
-        os.chmod(socket_path, 0o600)
-        srv.listen(16)
+        if hasattr(os, "getuid"):
+            os.chmod(socket_path, 0o600)
+        srv.listen(128)
     except Exception:
         srv.close()
         raise

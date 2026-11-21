@@ -420,6 +420,7 @@ def test_env_wait_abandoned_on_keyboard_interrupt(spawn_peer: Any) -> None:
 
 def test_scoped_capture_closure_semantics_and_failure_restore(
     spawn_peer: Any,
+    tmp_path: Any,
 ) -> None:
     """Covers closure-like scoped capture across all 7 live-peer cases."""
     worker = spawn_peer()
@@ -459,8 +460,19 @@ def test_scoped_capture_closure_semantics_and_failure_restore(
 
     # 5c: restore after interrupt (\x03 on pty master during sleep).
     x = "int-cmd"
-    r_int = worker.send("sleep 5", capture=["x"])
-    time.sleep(0.25)
+    int_marker = tmp_path / "int_started"
+    r_int = worker.send(
+        "import pathlib, time\n"
+        f"pathlib.Path({str(int_marker)!r}).write_text('go', "
+        "encoding='utf-8')\n"
+        "time.sleep(5)\n",
+        capture=["x"],
+    )
+    deadline = time.monotonic() + 10.0
+    while not int_marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert int_marker.exists(), "Interrupt test block did not start"
+    time.sleep(0.05)
     master_fd = worker._ctrl.state.master_fd
     assert master_fd is not None
     os.write(master_fd, b"\x03")

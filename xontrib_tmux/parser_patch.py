@@ -43,6 +43,9 @@ from .protocol import HIDDEN_PEER_ENV, PEER_SOCKET_ENV
 
 
 _FSTRING_TOKENS = ("FSTRING_START", "FSTRING_MIDDLE", "FSTRING_END")
+_FSTRING_PREFIXES = frozenset(
+    {"f", "F", "fr", "fR", "Fr", "FR", "rf", "rF", "Rf", "RF"}
+)
 _NODEDENT_LHS = ("nodedent", "any_dedent_tok", "any_dedent_toks")
 
 _peer_socket_path: str | None = None
@@ -216,13 +219,31 @@ def _is_autoload_disabled() -> bool:
 
 def _find_unterminated_fstring(src: str) -> Optional[str]:
     """Returns an error message if ``src`` has an unterminated f-string."""
+    prev: Optional[tokenize.TokenInfo] = None
     try:
-        for _ in tokenize.generate_tokens(io.StringIO(src).readline):
-            pass
+        for tok in tokenize.generate_tokens(io.StringIO(src).readline):
+            if (
+                tok.type == tokenize.ERRORTOKEN
+                and tok.string in ("'", '"')
+                and prev is not None
+                and prev.type == tokenize.NAME
+                and prev.string in _FSTRING_PREFIXES
+                and prev.end == tok.start
+            ):
+                return "unterminated f-string literal"
+            prev = tok
     except tokenize.TokenError as exc:
         msg = exc.args[0] if exc.args else ""
         if "f-string" in msg:
             return msg
+        if "multi-line string" in msg and len(exc.args) >= 2:
+            lineno, col = exc.args[1]
+            lines = src.splitlines()
+            if 1 <= lineno <= len(lines):
+                rest = lines[lineno - 1][col:]
+                prefix = rest.split("'", 1)[0].split('"', 1)[0]
+                if prefix in _FSTRING_PREFIXES:
+                    return msg
     except IndentationError:
         pass
     return None

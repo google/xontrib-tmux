@@ -26,6 +26,7 @@ import socket
 import stat
 import struct
 import sys
+import tempfile
 import threading
 import types
 from typing import Any, IO
@@ -86,18 +87,26 @@ def _verify_dir(path: pathlib.Path) -> pathlib.Path:
         raise PermissionError(
             f"Socket directory {path} is not a real directory"
         )
-    uid = os.getuid()
-    if st.st_uid != uid:
-        raise PermissionError(
-            f"Socket directory {path} is owned by uid {st.st_uid}, "
-            f"expected {uid}"
-        )
-    if (st.st_mode & 0o077) != 0:
-        raise PermissionError(
-            f"Socket directory {path} has unsafe mode "
-            f"{oct(stat.S_IMODE(st.st_mode))}; expected 0o700"
-        )
+    if hasattr(os, "getuid"):
+        uid = os.getuid()
+        if st.st_uid != uid:
+            raise PermissionError(
+                f"Socket directory {path} is owned by uid {st.st_uid}, "
+                f"expected {uid}"
+            )
+        if (st.st_mode & 0o077) != 0:
+            raise PermissionError(
+                f"Socket directory {path} has unsafe mode "
+                f"{oct(stat.S_IMODE(st.st_mode))}; expected 0o700"
+            )
     return path
+
+
+def _fallback_socket_dir() -> pathlib.Path:
+    """Returns the platform default socket directory path."""
+    if hasattr(os, "getuid"):
+        return pathlib.Path(f"/tmp/xontrib-tmux-{os.getuid()}")
+    return pathlib.Path(tempfile.gettempdir()) / "xontrib-tmux"
 
 
 def socket_dir() -> pathlib.Path:
@@ -105,7 +114,8 @@ def socket_dir() -> pathlib.Path:
 
     Uses ``$XDG_RUNTIME_DIR/xontrib-tmux`` when ``$XDG_RUNTIME_DIR`` is set and
     the resulting path is shorter than 80 UTF-8 bytes; otherwise falls back to
-    ``/tmp/xontrib-tmux-<uid>``.
+    ``/tmp/xontrib-tmux-<uid>`` on POSIX or ``<tempdir>/xontrib-tmux`` on
+    Windows.
 
     Returns:
         Path to the verified ``0o700`` socket directory.
@@ -119,7 +129,7 @@ def socket_dir() -> pathlib.Path:
         candidate = pathlib.Path(xdg) / "xontrib-tmux"
         if len(str(candidate).encode("utf-8")) < _MAX_SOCKET_DIR_BYTES:
             return _verify_dir(candidate)
-    return _verify_dir(pathlib.Path(f"/tmp/xontrib-tmux-{os.getuid()}"))
+    return _verify_dir(_fallback_socket_dir())
 
 
 def new_socket_path(prefix: str = "p") -> pathlib.Path:
@@ -142,9 +152,7 @@ def new_socket_path(prefix: str = "p") -> pathlib.Path:
     name = f"{prefix}_{pid}_{seq}.sock"
     path = sdir / name
     if len(str(path).encode("utf-8")) >= _MAX_SOCKET_PATH_BYTES:
-        fallback = _verify_dir(
-            pathlib.Path(f"/tmp/xontrib-tmux-{os.getuid()}")
-        )
+        fallback = _verify_dir(_fallback_socket_dir())
         path = fallback / name
     if len(str(path).encode("utf-8")) >= _MAX_SOCKET_PATH_BYTES:
         raise ValueError(
