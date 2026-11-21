@@ -178,27 +178,6 @@ def _win_cwd(olddir, newdir, **kw): tmux rename-window @(newdir.rsplit("/", 1)[-
   with `record=False`, vs. `3/1,000` with `$XONSH_CAPTURE_ALWAYS` enabled), at
   the cost of not recording `out`/`err`/per-command output.
 
-## Changes for existing users
-
-| Before | After |
-| --- | --- |
-| `tmuxs(name)`, `tmuxw(name)`, `tmuxp()` | `xsess(name)`, `xwin(name)`, `xpane()`; they still return a libtmux `Session`, `Window`, and `Pane` |
-| `tmuxp()` splits the window's active pane and forwards positional arguments to `split()` | `xpane()` splits the caller's own pane; its positional argument is the pane to split, and options are keywords |
-| New panes run the first `xonsh` on `$PATH` | They run the calling shell's interpreter (`sys.executable`) |
-| `tmuxs(name)` returns an existing session whatever it runs; `tmuxs(name, existing=False)` raises on an existing name | `xsess(name)` returns an existing session only if its active pane holds a peer, and raises otherwise |
-| `send()` types into whatever the target pane runs, including a xonsh the plugin did not start | `send()` reaches only a peer started by `xsess()`, `xwin()`, `xpane()`, or `RemoteXonsh()`, and raises where there is none; `Pane.send_keys()` types into other panes |
-| A block reaches the other shell by being typed into its pane | It is handed to the peer over a local socket, and the peer submits it to itself |
-| `send()` returns a future that completes when the keys have been typed | `send()` returns a `PeerResult` that is filled in when the block has finished |
-| `with! x.send() as m` binds an object whose `future` completes on delivery | It binds the `PeerResult` |
-| Each statement of a block is its own entry: later statements run after a failed one, and each is a history entry and a window-name change | A block is one entry: a failing command stops the rest, and there is one history entry and one window-name change |
-| Commands in a sent block run as if typed | They are recorded unless sent with `record=False`, which avoids pty/tty capture side effects for interactive TUIs |
-| A block sent to a busy shell is typed at once and read at its next prompt | It waits in the peer until the peer's prompt is idle |
-| With `capture=`, a typed line loads the variables in the other shell; the string form of `send()` ignores `capture=` | The variables travel with the block in both forms, are scoped to the block like a by-value closure (saving and restoring previous `ctx` bindings), are logged in a leading `# captured: ...` comment line visible in the pane and history, and print a `# restored: ...; unset: ...` terminal line when restored |
-| When `$TMUX` is set to a dead or invalid server, server lookups fall back to the default server | `xsess()` raises `RuntimeError` naming the bad `$TMUX` and recommending clearing `TMUX`; it falls back to the default server only when `$TMUX` is unset |
-| When `$XONTRIB_TMUX_READY_TIMEOUT` passes, the block is typed anyway | The block fails with `RuntimeError` |
-| Delivery failures are printed on the sender's standard error | They are raised by the `PeerResult`, and printed only when nobody reads the result |
-| `Session.attach()` inside tmux fails | It switches the client; `exit_` and `flags_` raise `ValueError` there |
-
 ## Installation
 
 Requires Python >= 3.11 and `xonsh >= 0.24.0`.
