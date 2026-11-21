@@ -25,6 +25,7 @@ import re
 import socket
 import stat
 import struct
+import sys
 import threading
 import types
 from typing import Any, IO
@@ -152,21 +153,81 @@ def new_socket_path(prefix: str = "p") -> pathlib.Path:
     return path
 
 
+_SOL_LOCAL = getattr(socket, "SOL_LOCAL", 0)
+_LOCAL_PEERPID = getattr(socket, "LOCAL_PEERPID", 2)
+_XUCRED_HEADER_FMT = "II"
+_XUCRED_BUF_SIZE = max(struct.calcsize("IIh16I"), 128)
+
+
+def _peer_creds(conn: socket.socket) -> tuple[int, int]:
+    """Returns ``(pid, uid)`` for a connected ``AF_UNIX`` stream socket."""
+    if hasattr(socket, "SO_PEERCRED"):
+        cred_size = struct.calcsize("3i")
+        creds = conn.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, cred_size
+        )
+        if sys.platform.startswith("openbsd"):
+            uid, _gid, pid = struct.unpack("IIi", creds)
+        else:
+            pid, uid, _gid = struct.unpack("iII", creds)
+        return pid, uid
+
+    if hasattr(socket, "LOCAL_PEERCRED"):
+        creds = conn.getsockopt(
+            _SOL_LOCAL, socket.LOCAL_PEERCRED, _XUCRED_BUF_SIZE
+        )
+        header_size = struct.calcsize(_XUCRED_HEADER_FMT)
+        if len(creds) < header_size:
+            raise OSError(
+                f"Short LOCAL_PEERCRED response: {len(creds)} bytes"
+            )
+        version, uid = struct.unpack_from(_XUCRED_HEADER_FMT, creds)
+        if version != 0:
+            raise OSError(f"Unsupported xucred version: {version}")
+        pid = 0
+        if sys.platform == "darwin" or hasattr(socket, "LOCAL_PEERPID"):
+            pid_size = struct.calcsize("i")
+            pid_bytes = conn.getsockopt(_SOL_LOCAL, _LOCAL_PEERPID, pid_size)
+            (pid,) = struct.unpack("i", pid_bytes)
+        elif sys.platform.startswith("freebsd"):
+            pid_offset = struct.calcsize("IIh16I")
+            pid_size = struct.calcsize("i")
+            if len(creds) >= pid_offset + pid_size:
+                (pid,) = struct.unpack_from("i", creds, pid_offset)
+        return pid, uid
+
+    if hasattr(socket, "LOCAL_PEEREID"):
+        cred_size = struct.calcsize("iII")
+        creds = conn.getsockopt(_SOL_LOCAL, socket.LOCAL_PEEREID, cred_size)
+        pid, uid, _gid = struct.unpack("iII", creds)
+        return pid, uid
+
+    raise NotImplementedError(
+        "Peer credential verification is not supported on this platform"
+    )
+
+
 def verify_peer_uid(conn: socket.socket) -> int:
-    """Verifies via ``SO_PEERCRED`` that the connected peer has our UID.
+    """Verifies via peer credentials that the connected peer has our UID.
+
+    Uses ``SO_PEERCRED`` on Linux/OpenBSD, ``LOCAL_PEERCRED`` (with
+    ``LOCAL_PEERPID`` on macOS) on macOS/FreeBSD, and ``LOCAL_PEEREID`` on
+    NetBSD. On Windows (where POSIX UIDs do not exist), socket access relies
+    on per-user temporary directory ACLs and this function returns ``0``.
 
     Args:
         conn: Connected ``AF_UNIX`` stream socket.
 
     Returns:
-        The connected peer's PID.
+        The connected peer's PID (or ``0`` if the platform does not report a
+        peer PID).
 
     Raises:
         PermissionError: If the peer's UID does not match ``os.getuid()``.
     """
-    cred_size = struct.calcsize("3i")
-    creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, cred_size)
-    pid, uid, _gid = struct.unpack("3i", creds)
+    if not hasattr(os, "getuid"):
+        return 0
+    pid, uid = _peer_creds(conn)
     expected_uid = os.getuid()
     if uid != expected_uid:
         raise PermissionError(

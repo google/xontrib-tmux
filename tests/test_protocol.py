@@ -22,6 +22,7 @@ import os
 import pathlib
 import socket
 import stat
+import struct
 import subprocess
 import sys
 import tempfile
@@ -217,6 +218,130 @@ def test_verify_peer_uid(monkeypatch: pytest.MonkeyPatch) -> None:
     finally:
         s1.close()
         s2.close()
+
+
+def test_verify_peer_uid_so_peercred_and_local_peercred(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_uid = os.getuid()
+
+    class _FakeLinuxSock:
+        def __init__(self, pid: int, uid: int, gid: int = 0) -> None:
+            self._payload = struct.pack("iII", pid, uid, gid)
+
+        def getsockopt(self, level: int, optname: int, buflen: int) -> bytes:
+            assert level == socket.SOL_SOCKET
+            assert optname == 17
+            assert buflen == struct.calcsize("3i")
+            return self._payload
+
+    monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert protocol.verify_peer_uid(_FakeLinuxSock(4321, expected_uid)) == 4321
+    with pytest.raises(PermissionError):
+        protocol.verify_peer_uid(_FakeLinuxSock(4321, expected_uid + 1))
+
+    class _FakeDarwinSock:
+        def __init__(
+            self,
+            pid: int,
+            uid: int,
+            version: int = 0,
+            short: bool = False,
+        ) -> None:
+            self._pid = pid
+            self._cred = (
+                b"\x00\x00"
+                if short
+                else struct.pack("IIh16I", version, uid, 1, *([0] * 16))
+            )
+
+        def getsockopt(self, level: int, optname: int, buflen: int) -> bytes:
+            assert level == protocol._SOL_LOCAL
+            if optname == 1:
+                assert buflen >= len(self._cred)
+                return self._cred
+            if optname == protocol._LOCAL_PEERPID:
+                assert buflen == struct.calcsize("i")
+                return struct.pack("i", self._pid)
+            raise AssertionError(f"Unexpected optname {optname}")
+
+    monkeypatch.delattr(socket, "SO_PEERCRED", raising=False)
+    monkeypatch.setattr(socket, "LOCAL_PEERCRED", 1, raising=False)
+    monkeypatch.setattr(sys, "platform", "darwin")
+    assert (
+        protocol.verify_peer_uid(_FakeDarwinSock(9876, expected_uid)) == 9876
+    )
+    with pytest.raises(PermissionError):
+        protocol.verify_peer_uid(_FakeDarwinSock(9876, expected_uid + 1))
+    with pytest.raises(OSError, match="Unsupported xucred version"):
+        protocol.verify_peer_uid(
+            _FakeDarwinSock(9876, expected_uid, version=1)
+        )
+    with pytest.raises(OSError, match="Short LOCAL_PEERCRED"):
+        protocol.verify_peer_uid(
+            _FakeDarwinSock(9876, expected_uid, short=True)
+        )
+
+    monkeypatch.delattr(socket, "LOCAL_PEERCRED", raising=False)
+    monkeypatch.delattr(socket, "LOCAL_PEEREID", raising=False)
+    with pytest.raises(NotImplementedError):
+        protocol.verify_peer_uid(_FakeDarwinSock(9876, expected_uid))
+
+    # OpenBSD SO_PEERCRED layout: (uid, gid, pid).
+    class _FakeOpenBSDSock:
+        def __init__(self, pid: int, uid: int, gid: int = 0) -> None:
+            self._payload = struct.pack("IIi", uid, gid, pid)
+
+        def getsockopt(self, level: int, optname: int, buflen: int) -> bytes:
+            assert level == socket.SOL_SOCKET
+            assert optname == 17
+            return self._payload
+
+    monkeypatch.setattr(socket, "SO_PEERCRED", 17, raising=False)
+    monkeypatch.setattr(sys, "platform", "openbsd7")
+    assert (
+        protocol.verify_peer_uid(_FakeOpenBSDSock(2468, expected_uid)) == 2468
+    )
+
+    # FreeBSD LOCAL_PEERCRED with trailing cr_pid.
+    class _FakeFreeBSDSock:
+        def __init__(self, pid: int, uid: int) -> None:
+            self._cred = struct.pack("IIh16Ii", 0, uid, 1, *([0] * 16), pid)
+
+        def getsockopt(self, level: int, optname: int, buflen: int) -> bytes:
+            assert level == protocol._SOL_LOCAL
+            assert optname == 1
+            return self._cred
+
+    monkeypatch.delattr(socket, "SO_PEERCRED", raising=False)
+    monkeypatch.setattr(socket, "LOCAL_PEERCRED", 1, raising=False)
+    monkeypatch.delattr(socket, "LOCAL_PEERPID", raising=False)
+    monkeypatch.setattr(sys, "platform", "freebsd14")
+    assert (
+        protocol.verify_peer_uid(_FakeFreeBSDSock(1357, expected_uid)) == 1357
+    )
+
+    # NetBSD LOCAL_PEEREID layout: (pid, euid, egid).
+    class _FakeNetBSDSock:
+        def __init__(self, pid: int, uid: int, gid: int = 0) -> None:
+            self._payload = struct.pack("iII", pid, uid, gid)
+
+        def getsockopt(self, level: int, optname: int, buflen: int) -> bytes:
+            assert level == protocol._SOL_LOCAL
+            assert optname == 3
+            return self._payload
+
+    monkeypatch.delattr(socket, "LOCAL_PEERCRED", raising=False)
+    monkeypatch.setattr(socket, "LOCAL_PEEREID", 3, raising=False)
+    monkeypatch.setattr(sys, "platform", "netbsd10")
+    assert (
+        protocol.verify_peer_uid(_FakeNetBSDSock(3690, expected_uid)) == 3690
+    )
+
+    # Windows (no os.getuid): returns 0 without querying POSIX peercred.
+    monkeypatch.delattr(os, "getuid", raising=False)
+    assert protocol.verify_peer_uid(object()) == 0  # type: ignore[arg-type]
 
 
 def test_strip_macro_comments() -> None:
