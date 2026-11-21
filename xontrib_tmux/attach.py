@@ -37,7 +37,8 @@ def _server_socket_path(server: libtmux.Server | None) -> str:
         return str(socket_path)
     socket_name = getattr(server, "socket_name", None) or "default"
     tmpdir = (os.environ.get("TMUX_TMPDIR") or "/tmp").rstrip("/") or "/tmp"
-    return f"{tmpdir}/tmux-{os.getuid()}/{socket_name}"
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    return f"{tmpdir}/tmux-{uid}/{socket_name}"
 
 
 def _format_stderr(stderr: Any) -> str:

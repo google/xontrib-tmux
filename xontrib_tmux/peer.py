@@ -17,23 +17,33 @@
 import atexit
 from collections.abc import Callable, Iterator, MutableMapping, Sequence
 from concurrent.futures import InvalidStateError
-import fcntl
 import inspect
 import os
 import pathlib
-import pty
 import queue
 import signal
 import socket
 import struct
 import subprocess
 import sys
-import termios
 import threading
 import time
 from typing import Any
 import uuid
 import weakref
+
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
+try:
+    import pty
+except ImportError:
+    pty = None  # type: ignore[assignment]
+try:
+    import termios
+except ImportError:
+    termios = None  # type: ignore[assignment]
 
 from .protocol import (
     HIDDEN_PEER_ENV,
@@ -243,17 +253,20 @@ class _PeerController:
 
 def _copy_starter_winsize() -> bytes:
     """Returns packed ``TIOCGWINSZ`` from starter's tty or 24x80 fallback."""
-    for stream in (sys.stdin, sys.stdout, sys.stderr):
-        try:
-            fd = stream.fileno()
-        except (AttributeError, OSError, ValueError):
-            continue
-        if not os.isatty(fd):
-            continue
-        try:
-            return fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\x00" * 8)
-        except OSError:
-            continue
+    if fcntl is not None and termios is not None and hasattr(
+        termios, "TIOCGWINSZ"
+    ):
+        for stream in (sys.stdin, sys.stdout, sys.stderr):
+            try:
+                fd = stream.fileno()
+            except (AttributeError, OSError, ValueError):
+                continue
+            if not os.isatty(fd):
+                continue
+            try:
+                return fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\x00" * 8)
+            except OSError:
+                continue
     return struct.pack("HHHH", _DEFAULT_ROWS, _DEFAULT_COLS, 0, 0)
 
 
@@ -830,51 +843,73 @@ class RemoteXonsh:
     def __init__(self) -> None:
         """Spawns a new hidden-terminal peer xonsh in the background."""
         socket_path = new_socket_path("hidden")
-        master_fd, slave_fd = pty.openpty()
-        try:
-            winsize = _copy_starter_winsize()
-            fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
+        child_env = os.environ.copy()
+        child_env[PEER_SOCKET_ENV] = str(socket_path)
+        child_env[HIDDEN_PEER_ENV] = "1"
+        cmd = [sys.executable, "-m", "xonsh", "-i"]
+        master_fd: int | None = None
 
-            child_env = os.environ.copy()
-            child_env[PEER_SOCKET_ENV] = str(socket_path)
-            child_env[HIDDEN_PEER_ENV] = "1"
+        if pty is not None and fcntl is not None and termios is not None:
+            master_fd, slave_fd = pty.openpty()
+            try:
+                winsize = _copy_starter_winsize()
+                fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, winsize)
 
-            def _setup_child_tty() -> None:
-                os.setsid()
-                fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+                def _setup_child_tty() -> None:
+                    os.setsid()
+                    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
 
+                start_time = time.monotonic()
+                proc = subprocess.Popen(
+                    cmd,
+                    stdin=slave_fd,
+                    stdout=slave_fd,
+                    stderr=slave_fd,
+                    env=child_env,
+                    preexec_fn=_setup_child_tty,
+                    close_fds=True,
+                )
+            except BaseException:
+                try:
+                    os.close(slave_fd)
+                except OSError:
+                    pass
+                try:
+                    os.close(master_fd)
+                except OSError:
+                    pass
+                raise
+
+            os.close(slave_fd)
+        else:
+            popen_kwargs: dict[str, Any] = {
+                "env": child_env,
+                "close_fds": True,
+            }
+            if sys.platform == "win32":
+                startupinfo = subprocess.STARTUPINFO()  # type: ignore[attr-defined]
+                startupinfo.dwFlags |= (
+                    subprocess.STARTF_USESHOWWINDOW  # type: ignore[attr-defined]
+                )
+                startupinfo.wShowWindow = (
+                    subprocess.SW_HIDE  # type: ignore[attr-defined]
+                )
+                popen_kwargs["startupinfo"] = startupinfo
+                popen_kwargs["creationflags"] = getattr(
+                    subprocess, "CREATE_NEW_CONSOLE", 0
+                ) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
             start_time = time.monotonic()
-            cmd = [sys.executable, "-m", "xonsh", "-i"]
-            proc = subprocess.Popen(
-                cmd,
-                stdin=slave_fd,
-                stdout=slave_fd,
-                stderr=slave_fd,
-                env=child_env,
-                preexec_fn=_setup_child_tty,
-                close_fds=True,
-            )
-        except BaseException:
-            try:
-                os.close(slave_fd)
-            except OSError:
-                pass
-            try:
-                os.close(master_fd)
-            except OSError:
-                pass
-            raise
-
-        os.close(slave_fd)
+            proc = subprocess.Popen(cmd, **popen_kwargs)
 
         def _is_alive() -> bool:
             return proc.poll() is None
 
         def _on_kill() -> None:
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except OSError:
-                pass
+            if hasattr(os, "killpg") and hasattr(signal, "SIGKILL"):
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    pass
             if proc.poll() is None:
                 try:
                     proc.kill()
@@ -893,12 +928,13 @@ class RemoteXonsh:
             on_kill=_on_kill,
             master_fd=master_fd,
         )
-        drainer = threading.Thread(
-            target=_drain_pty,
-            args=(ctrl.state,),
-            daemon=True,
-        )
-        drainer.start()
+        if master_fd is not None:
+            drainer = threading.Thread(
+                target=_drain_pty,
+                args=(ctrl.state,),
+                daemon=True,
+            )
+            drainer.start()
 
         self._ctrl = ctrl
         self._socket_path = socket_path
