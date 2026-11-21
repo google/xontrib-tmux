@@ -119,12 +119,13 @@ def _controlling_tty_rdev() -> int:
     except (OSError, ValueError, IndexError):
         pass
 
-    for fd in (0, 1, 2):
-        try:
-            tty = os.ttyname(fd)
-            return os.stat(tty).st_rdev
-        except OSError:
-            continue
+    if hasattr(os, "ttyname"):
+        for fd in (0, 1, 2):
+            try:
+                tty = os.ttyname(fd)
+                return os.stat(tty).st_rdev
+            except OSError:
+                continue
     return 0
 
 
@@ -234,10 +235,10 @@ def _is_pid_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
         return True
-    except ProcessLookupError:
-        return False
     except PermissionError:
         return True
+    except OSError:
+        return False
 
 
 def _evict_pane_peers(pane: libtmux.Pane) -> None:
@@ -373,12 +374,14 @@ def get_pane_xonsh(pane: libtmux.Pane) -> RemoteXonsh | None:
             return _is_pid_alive(noted_pid)
 
         def _on_kill() -> None:
+            if hasattr(os, "killpg") and hasattr(signal, "SIGKILL"):
+                try:
+                    os.killpg(noted_pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            kill_sig = getattr(signal, "SIGKILL", signal.SIGTERM)
             try:
-                os.killpg(noted_pid, signal.SIGKILL)
-            except OSError:
-                pass
-            try:
-                os.kill(noted_pid, signal.SIGKILL)
+                os.kill(noted_pid, kill_sig)
             except OSError:
                 pass
             deadline = time.monotonic() + 0.5
