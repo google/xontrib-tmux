@@ -9,16 +9,17 @@ Example GitHub Issue dashboard:
 ```xonsh
 @aliases.register
 def _triage(args):
+    '''
+    Use from within a checked out GitHub repo.
+    '''
     issue = args[0]
     name = f"gh-{issue}"
-    fresh = not libtmux.Server().has_session(name)
-    work = xsess(name)
-    if fresh:
-        with! work.send(capture=["issue"], record=False):
-            gh issue view @(issue)
-            with! xpane().send(capture=["issue"], record=False):
-                claude -p @(f"Diagnose GitHub issue {issue}")
-    work.attach()
+    sess = xsess(name)
+    with! sess.send(capture=["issue"], record=False):
+        gh issue view @(issue)
+        with! xpane().send(capture=["issue"], record=False):
+            agy --prompt-interactive @(f"Diagnose GitHub issue {issue}")
+    sess.attach()
 ```
 
 ## Architecture
